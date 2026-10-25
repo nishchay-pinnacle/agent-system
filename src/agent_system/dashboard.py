@@ -1,0 +1,151 @@
+"""Read-only, loopback-only dashboard for one saved research job."""
+
+import argparse
+import json
+from functools import partial
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.resources import files
+from pathlib import Path
+from socket import socket
+from socketserver import BaseServer
+from urllib.parse import parse_qs, unquote, urlsplit
+
+from pydantic import JsonValue
+
+from agent_system.company_intelligence.artifacts import read_events, read_json
+from agent_system.company_intelligence.schemas import Source
+from agent_system.company_intelligence.tools import excerpt
+from agent_system.config import data_directory
+from agent_system.worker import job_id_argument
+
+
+def job_directory(data_dir: Path, job_id: str) -> Path:
+    canonical = job_id_argument(job_id)
+    directory = data_dir / "jobs" / canonical
+    if directory.is_symlink() or not (directory / "dashboard.json").is_file():
+        raise ValueError("Research job not found")
+    return directory
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    def __init__(
+        self,
+        request: socket | tuple[bytes, socket],
+        client_address: object,
+        server: BaseServer,
+        *,
+        directory: Path,
+    ) -> None:
+        self.directory = directory
+        super().__init__(request, client_address, server)
+
+    def do_GET(self) -> None:
+        parsed = urlsplit(self.path)
+        route = unquote(parsed.path)
+        query = parse_qs(parsed.query)
+        try:
+            if route == "/":
+                self.send_body(
+                    200,
+                    files("agent_system").joinpath("dashboard.html").read_bytes(),
+                    "text/html; charset=utf-8",
+                )
+                return
+            if route == "/api/state":
+                dashboard = read_json(self.directory / "dashboard.json")
+                records = sorted((self.directory / "investigations").glob("*.json"))[
+                    -12:
+                ]
+                self.send_json(
+                    200,
+                    {
+                        "dashboard": dashboard,
+                        "profile": read_json(self.directory / "profile.json"),
+                        "sources": read_json(self.directory / "sources.json"),
+                        "investigations": [read_json(p) for p in records],
+                    },
+                )
+            elif route == "/api/events":
+                after = int(query.get("after", ["0"])[0])
+                if after < 0:
+                    raise ValueError("after must be nonnegative")
+                self.send_json(
+                    200, {"events": [e for e in read_events(self.directory, after)]}
+                )
+            elif route.startswith("/api/source/"):
+                sid = route.removeprefix("/api/source/")
+                manifest = read_json(self.directory / "sources.json")
+                if sid not in manifest:
+                    self.send_json(404, {"error": "Source not found"})
+                    return
+                source = Source.model_validate(manifest[sid])
+                result = excerpt(
+                    self.directory,
+                    source,
+                    int(query.get("start_line", ["1"])[0]),
+                    int(query.get("max_lines", ["200"])[0]),
+                )
+                self.send_json(200, result)
+            elif route == "/api/result":
+                path = self.directory / "result.json"
+                self.send_json(
+                    200 if path.exists() else 404,
+                    read_json(path)
+                    if path.exists()
+                    else {"status": "not_yet_available"},
+                )
+            else:
+                self.send_json(404, {"error": "Route not found"})
+        except (ValueError, OSError) as exc:
+            self.send_json(400, {"error": str(exc)[:200]})
+
+    def send_json(self, status: int, value: dict[str, JsonValue]) -> None:
+        self.send_body(
+            status, json.dumps(value).encode(), "application/json; charset=utf-8"
+        )
+
+    def send_body(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+        )
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+def make_server(directory: Path, port: int) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer(
+        ("127.0.0.1", port), partial(DashboardHandler, directory=directory)
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--job", required=True, type=job_id_argument)
+    parser.add_argument("--port", default=8765, type=int)
+    args = parser.parse_args()
+    try:
+        directory = job_directory(data_directory(), args.job)
+        with make_server(directory, args.port) as server:
+            print(
+                f"Read-only dashboard: http://127.0.0.1:{server.server_port}",
+                flush=True,
+            )
+            server.serve_forever()
+    except KeyboardInterrupt:
+        return 0
+    except (ValueError, OSError) as exc:
+        parser.exit(1, f"Dashboard: {exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
