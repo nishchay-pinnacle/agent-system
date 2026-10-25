@@ -17,7 +17,7 @@ Profile keys and coverage:
 - problems_and_use_cases: tasks, obstacles, alternatives, changed approach, differing
   use cases and desired outcomes. Workflows are optional.
 - customer_fit: organizational fit, prerequisites, segment differences, poor fit,
-  demonstrated customers versus intended targets.
+  evidence supporting proposed fit, distinguishing inference and intended positioning.
 - people_and_roles: users, problem owners, champions, buyers, evaluators, goals and
   concerns; one person can occupy several roles. Do not invent personas.
 - buying_decisions: triggers, alternatives/doing nothing, selection criteria,
@@ -47,7 +47,7 @@ unsuccessful attempts park a gap; reopen only with a named NEW source ID and rea
 Three consecutive investigations without progress require final review.
 
 Final review (same model): challenge generic descriptions, wrong-product attribution,
-unsupported inference, advertised versus demonstrated fit, missing coverage and
+unsupported inference, evidence supporting fit versus inference or intended positioning, missing coverage and
 contradictions. Review can return to ONE specifically named investigation, then
 closing review MUST stop. Stop sufficient_understanding or public_sources_exhausted;
 the application enforces budget_reached. Separately assess readiness and consequential
@@ -69,3 +69,24 @@ answer its question. Preserve unresolved plans when budgets or review end the ru
 
 Use explicit assessment updates in update_investigation_plan when new evidence
 changes a question status. Investigation completion alone leaves it unchanged.
+
+
+Research aims to understand the product, problems, use, fit, people, buying decisions,
+and credible expertise. Never propose investigations solely to collect testimonials,
+logos, named customers, quotes, synonyms, or a customer-story collection. Customer
+stories are eligible sources only for substantive questions: what the customer did,
+deployment, prerequisites, integrations, limitations, outcomes with context, or decision
+factors. Extract useful facts with attribution. Generic praise/logos alone establish
+neither capability, deployment requirement, buyer role, nor general market fit.
+Distinguish observed facts, company claims, and reasoned inferences. Documentation
+can support a labelled fit inference, not demonstrated adoption. One example does
+not establish company-wide fit. Keep customer language alongside relevant findings.
+Missing public customer stories alone are not a consequential understanding gap and
+must not force an investigation. These are research selection rules, not instructions
+to delete customer content from evidence.
+
+Set assessment interview_question only for a concrete unresolved issue requiring
+company confirmation or appropriately carried into an interview. Ask a specific,
+answerable question; otherwise use null. Partial coverage, an unvisited public page,
+or a missing testimonial alone does not justify company input. Public-research gaps
+can remain unresolved with no interview question.

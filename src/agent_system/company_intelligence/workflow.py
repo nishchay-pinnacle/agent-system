@@ -33,6 +33,7 @@ from agent_system.company_intelligence.artifacts import (
     project,
     read_json,
     save_json,
+    source_path,
 )
 from agent_system.company_intelligence.call_traces import (
     finish_trace,
@@ -45,7 +46,13 @@ from agent_system.company_intelligence.orientation import (
     build_context,
     update_plan,
 )
-from agent_system.company_intelligence.page_content import CLEANER_VERSION, load_cleaned
+from agent_system.company_intelligence.page_content import (
+    CLEANER_VERSION,
+    artifact_path,
+    discovery_links,
+    load_cleaned,
+    write_capture,
+)
 from agent_system.company_intelligence.schemas import (
     Begin,
     Complete,
@@ -615,7 +622,10 @@ def consume(state: Research, directory: Path) -> None:
     if op.kind == "scrape_page":
         url = str(op.args["url"])
         sid = source_id(url)
-        if not fetched.markdown or not fetched.markdown.strip():
+        if not any(
+            value and value.strip()
+            for value in (fetched.markdown, fetched.html, fetched.raw_html)
+        ):
             state.sources[sid] = Source(
                 source_id=sid, requested_url=url, outcome="failed"
             )
@@ -625,7 +635,7 @@ def consume(state: Research, directory: Path) -> None:
                 state,
                 {
                     "source_id": sid,
-                    "error": "No Markdown returned; this does not prove absence.",
+                    "error": "No page content returned; this does not prove absence.",
                 },
             )
             return
@@ -636,17 +646,32 @@ def consume(state: Research, directory: Path) -> None:
             title=fetched.title,
             fetched_at=now(),
             filename=f"sources/{sid}.md",
+            cleaner_version=CLEANER_VERSION,
+            capture_metadata={
+                "formats": ["markdown", "html", "rawHtml"],
+                "only_main_content": False,
+            },
             outcome="success",
         )
-        target = directory / str(source.filename)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if not target.exists():
-            temporary = target.with_suffix(".tmp")
-            temporary.write_text(fetched.markdown, encoding="utf-8")
-            temporary.replace(target)
+        write_capture(source_path(directory, source), fetched.markdown or "")
+        for representation, value, suffix in (
+            ("html_filename", fetched.html, ".html"),
+            ("raw_html_filename", fetched.raw_html, ".raw.html"),
+        ):
+            if value is not None:
+                filename = f"sources/{sid}{suffix}"
+                write_capture(
+                    artifact_path(directory, source, filename, {suffix}), value
+                )
+                setattr(source, representation, filename)
         state.sources[sid] = source
-        state.usage.pages += 1
         cleaned = load_cleaned(directory, source)
+        state.usage.pages += 1
+        links = discovery_links(directory, source)
+        if links:
+            state.discovery = save_inventory(
+                directory, links, f"cleaning:{sid}", state.settings.map_limit
+            )
         if state.schema_version >= 2 and state.phase == "orientation":
             if not cleaned.strip():
                 raise ValueError("Required orientation page has empty cleaned content")

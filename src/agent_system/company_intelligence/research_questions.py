@@ -1,6 +1,6 @@
-"""Fixed question catalog for product research, version 1."""
+"""Fixed question catalog for product research, version 2."""
 
-CATALOG_VERSION = 1
+CATALOG_VERSION = 2
 QUESTIONS: dict[str, str] = {
     "S1": "What does the company do?",
     "S2": "Which specific product is this campaign about?",
@@ -25,7 +25,7 @@ QUESTIONS: dict[str, str] = {
     "F3": "What prerequisites make the product useful?",
     "F4": "How do segments use it differently?",
     "F5": "Who is a poor fit and why?",
-    "F6": "Which segments are demonstrated customers versus intended targets?",
+    "F6": "What evidence supports the proposed customer fit, and which parts are inferred or only intended positioning?",
     "P1": "Who experiences the problem?",
     "P2": "Who uses the product?",
     "P3": "Who initiates the search and champions adoption?",

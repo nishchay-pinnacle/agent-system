@@ -9,7 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 from openai.types.responses import ToolParam
 from pydantic import BaseModel, JsonValue
 
-from agent_system.company_intelligence.page_content import CLEANER_VERSION, load_cleaned
+from agent_system.company_intelligence.page_content import load_cleaned
 from agent_system.company_intelligence.schemas import (
     Begin,
     Complete,
@@ -165,7 +165,8 @@ def excerpt(
     return {
         "source_id": source.source_id,
         "representation": "cleaned",
-        "cleaner_version": CLEANER_VERSION,
+        "cleaner_version": source.cleaner_version,
+        "cleaning_summary": source.cleaning_summary,
         "content_hash": source.cleaned_hash,
         "delivery": "excerpt",
         "url": source.requested_url,

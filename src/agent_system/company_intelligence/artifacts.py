@@ -11,7 +11,14 @@ from typing import Iterator
 
 from pydantic import JsonValue, TypeAdapter
 
-from agent_system.company_intelligence.schemas import Research, Source
+from agent_system.company_intelligence.research_questions import QUESTIONS
+from agent_system.company_intelligence.schemas import (
+    Gap,
+    PlanEntry,
+    QuestionAssessment,
+    Research,
+    Source,
+)
 from agent_system.workflow import write_output
 
 JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
@@ -94,6 +101,53 @@ def source_path(directory: Path, source: Source) -> Path:
     return path
 
 
+def project_gaps(
+    assessments: list[QuestionAssessment], plans: list[PlanEntry], gaps: list[Gap]
+) -> tuple[list[dict[str, JsonValue]], list[str]]:
+    """Derive reporting gaps without changing research state or resolution policy."""
+    projected: list[dict[str, JsonValue]] = []
+    for assessment in assessments:
+        if assessment.status not in {"partial", "unassessed"}:
+            continue
+        linked = [
+            p
+            for p in plans
+            if p.question_id == assessment.question_id and p.status != "superseded"
+        ]
+        importance = list(dict.fromkeys(p.importance for p in linked))
+        projected.append(
+            {
+                "gap_id": f"assessment:{assessment.question_id}",
+                "origin": "assessment",
+                "question_id": assessment.question_id,
+                "question": QUESTIONS[assessment.question_id],
+                "status": assessment.status,
+                "answer": assessment.answer,
+                "state": "partial" if assessment.status == "partial" else "open",
+                "consequence": "\n".join(importance)
+                or "Required research question remains unresolved",
+                "source_ids": list(assessment.source_ids),
+                "plan_ids": [p.plan_id for p in linked],
+                "interview_question": assessment.interview_question,
+            }
+        )
+    projected.extend(
+        {**gap.model_dump(mode="json"), "origin": "gap"}
+        for gap in gaps
+        if gap.state != "answered"
+    )
+    questions: list[str] = []
+    seen: set[str] = set()
+    for item in projected:
+        question = item.get("interview_question")
+        if isinstance(question, str) and question.strip():
+            key = " ".join(question.split()).casefold()
+            if key not in seen:
+                questions.append(question.strip())
+                seen.add(key)
+    return projected, questions
+
+
 def project(directory: Path, state: Research) -> None:
     """Called only with checkpointed state; files never drive the worker."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -111,6 +165,8 @@ def project(directory: Path, state: Research) -> None:
         for item in state.events:
             if int(str(item["sequence"])) > last:
                 handle.write((json.dumps(item) + "\n").encode())
+    if state.status == "completed" and (directory / "result.json").exists():
+        return  # Repair interrupted event tails, but never migrate completed artifacts.
     profile = {k: v.model_dump(mode="json") for k, v in state.profile.items()}
     sources = {k: v.model_dump(mode="json") for k, v in state.sources.items()}
     save_json(
@@ -133,7 +189,10 @@ def project(directory: Path, state: Research) -> None:
         },
     )
     save_json(directory / "dashboard.json", summary)
-    if state.status == "completed":
+    if state.status == "completed" and not (directory / "result.json").exists():
+        gaps, interviews = project_gaps(
+            state.assessments, state.investigation_plan, state.gaps
+        )
         save_json(
             directory / "result.json",
             {
@@ -144,16 +203,8 @@ def project(directory: Path, state: Research) -> None:
                 "limiting_resource": state.limiting_resource,
                 "readiness": state.readiness,
                 "coverage": {k: v.coverage for k, v in state.profile.items()},
-                "consequential_gaps": [
-                    g.model_dump(mode="json")
-                    for g in state.gaps
-                    if g.state != "answered"
-                ],
-                "interview_questions": [
-                    g.interview_question
-                    for g in state.gaps
-                    if g.state != "answered" and g.interview_question
-                ],
+                "consequential_gaps": gaps,
+                "interview_questions": interviews,
                 "artifacts": {
                     "profile": "profile.json",
                     "orientation": "orientation.json",

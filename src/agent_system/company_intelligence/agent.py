@@ -46,6 +46,8 @@ class Generation(BaseModel):
 
 class FetchResult(BaseModel):
     markdown: str | None = None
+    html: str | None = None
+    raw_html: str | None = None
     title: str = ""
     final_url: str | None = None
     candidates: list[dict[str, str]] = Field(default_factory=list)
@@ -247,8 +249,8 @@ class LiveProviders:
                 url = public_url(str(args["url"]), resolve=True)
                 document = client.scrape(
                     url,
-                    formats=["markdown"],
-                    only_main_content=True,
+                    formats=["markdown", "html", "rawHtml"],
+                    only_main_content=False,
                     auto_resume=False,
                     timeout=milliseconds,
                 )
@@ -259,6 +261,8 @@ class LiveProviders:
                 credits = metadata.credits_used if metadata else None
                 return FetchResult(
                     markdown=document.markdown,
+                    html=document.html,
+                    raw_html=document.raw_html,
                     title=metadata.title or "" if metadata else "",
                     final_url=final,
                     credits=credits if isinstance(credits, (int, float)) else None,

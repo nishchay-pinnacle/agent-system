@@ -5,9 +5,12 @@ description = "Local company intelligence research with persistent checkpoints"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "beautifulsoup4>=4.15.0",
     "firecrawl-py>=4.54.0",
     "langgraph",
     "langgraph-checkpoint-sqlite",
+    "markdown-it-py>=4.2.0",
+    "markdownify>=1.2.3",
     "openai>=3.37.0",
     "pydantic>=2.14.1",
     "python-dotenv",

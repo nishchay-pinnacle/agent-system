@@ -102,6 +102,33 @@ Readiness is independently `ready` or `needs_review`. A critical unresolved prod
 boundary always requires review. Completed jobs, including budget stops, cannot be
 reopened by resume. Missing coverage is retained rather than filled with inventions.
 
+## Cleaning and result interpretation
+
+Each scrape requests Markdown, HTML and raw HTML in one call without main-content
+filtering. Cleaner v2 prefers usable HTML, then raw HTML, then conservative Markdown.
+Structural rules remove confirmed interface controls while preserving substantive
+prose, code, tables, hidden answers/variants, qualifiers and accessible labels. Complex
+tables retain semantic HTML, displayed as escaped text in the dashboard. Removed
+navigation links become searchable discovery leads, never evidence by themselves.
+Reports record fallbacks and uncertainty; model deliveries contain only a small summary.
+Inline images/SVG retain source-local references and archive locators, without media
+fetches, OCR or inferred visual meaning. Unicode normalization is limited to documented
+prose whitespace, line endings, leading BOM removal and NUL replacement with U+FFFD.
+
+Ambiguous DOM components survive; legacy Markdown lacks structural signals. Content
+loaded only after JavaScript interaction, diagrams and media may require further
+inspection. Empty/loading/error captures block successful source delivery. Existing
+cleaned filenames and bytes are honored; missing v1 copies use the original v1
+algorithm. No automatic recleaning, historical output migration or research rerun occurs.
+
+`result.json` projects every partial/unassessed assessment into `consequential_gaps`,
+alongside unresolved explicit gaps. Completed plans do not resolve assessments.
+`interview_questions` contains only explicit company-input questions on unresolved
+items, deduplicated without fabricating questions. It can be empty while public-research
+gaps remain. Readiness and stop meanings are unchanged. Research seeks substantive
+product understanding: customer stories can supply relevant facts, but testimonials,
+logos, named customers and quote collections are not investigation objectives.
+
 ## Limits and accounting
 
 | Limit | Default | Environment override |
@@ -158,7 +185,10 @@ connections are created during imports. This is the editable local `uv sync` set
 
 - `checkpoints.sqlite`: authoritative LangGraph workflow state.
 - `jobs/<job_id>/sources/<source_id>.md`: original fetched Markdown.
-- `sources/<source_id>.cleaned.md`: deterministic cleaned copy, separate from raw.
+- `sources/<source_id>.html` and `.raw.html`: unmodified HTML captures, when returned.
+- `sources/<source_id>.cleaned.v2.md`: canonical cleaned evidence; legacy `.cleaned.md` stays readable.
+- `sources/<source_id>.cleaning.v2.json`: representation choice, hashes/counts, structural
+  rule removals, warnings, navigation leads, asset locators and labelled JSON-LD metadata.
 - `sources.json`, `profile.json`: source manifest with representation, cleaner version,
   SHA-256 hashes and byte/line statistics; current eight-section profile.
 - `site_index.json`: normalized discovery leads, provenance and completeness summary.
@@ -175,7 +205,8 @@ connections are created during imports. This is the editable local `uv sync` set
   artifact references and usage; absent during errors/interruption.
 - `operations/*.json`, `discoveries/*.json`: reusable provider receipts/discovery results.
 
-Projections are rebuilt from saved workflow state when the worker resumes. Source
+Active-run projections are rebuilt from saved workflow state when the worker resumes.
+Completed outputs and historical source/call bytes are preserved. Source
 files and completed receipts can be reused after a crash; dashboard JSON does not
 drive execution. Data, `.env`, `.venv` and tool caches are Git-ignored.
 

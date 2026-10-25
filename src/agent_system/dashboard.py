@@ -189,6 +189,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "content": "\n".join(lines[start - 1 : end]),
                     "more": end < len(lines),
                     "cleaning_stats": source.model_dump(mode="json")["cleaning_stats"],
+                    "cleaning_summary": source.cleaning_summary,
+                    "content_hash": source.cleaned_hash
+                    if representation == "cleaned"
+                    else source.raw_hash,
                 }
                 self.send_json(200, result)
             elif route == "/api/result":

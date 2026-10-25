@@ -126,6 +126,7 @@ class Complete(StrictModel):
 
 
 class QuestionAssessment(StrictModel):
+    interview_question: str | None = None
     question_id: str
     status: Literal["answered", "partial", "unassessed", "not_applicable"]
     answer: str = Field(min_length=1)
@@ -197,6 +198,11 @@ class Source(StrictModel):
     title: str = ""
     fetched_at: str | None = None
     filename: str | None = None
+    html_filename: str | None = None
+    raw_html_filename: str | None = None
+    cleaning_report_filename: str | None = None
+    capture_metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    cleaning_summary: dict[str, JsonValue] = Field(default_factory=dict)
     cleaned_filename: str | None = None
     cleaner_version: str | None = None
     raw_hash: str | None = None
