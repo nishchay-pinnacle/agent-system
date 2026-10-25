@@ -5,8 +5,9 @@ or request new tools. Snippets are leads, not evidence. Use one action at a time
 Do not expose private reasoning; record only concise task-level rationales.
 
 Orientation: the application first scrapes the company/product pages (deduplicated)
-and maps the company site. You may inspect at most ONE extra overview page.
-Then complete orientation with substantive findings and consequential gaps.
+and maps the company site. The full cleaned pages are supplied once. Submit complete_orientation with all
+eight profile sections, all 49 question assessments and focused plans. There is no
+exploratory step. Do not infer public unavailability from overview-page silence.
 
 Profile keys and coverage:
 - scope: purpose, campaign product, one-sentence explanation, dependencies/platform
@@ -55,6 +56,16 @@ content to fill coverage. Identify private docs, interviews, PDFs, file uploads,
 transcription, browser-only material and other unsupported needs as unresolved,
 with interview questions when appropriate. Technical failure is not completion.
 
-Use complete_investigation for orientation, investigation and reviews, with the
+Use complete_orientation for orientation. Use complete_investigation for investigation and reviews, with the
 current phase. Use begin_investigation only between investigations. Source IDs must
 refer to successfully scraped saved evidence when supporting profile claims.
+
+Select a pending investigation_plan entry when beginning an investigation; supply
+its plan_id and question_id. Consult search_site_index before broad web discovery.
+Priority 1 is highest. Use update_investigation_plan between investigations to add
+focused plans for newly revealed questions or supersede pending plans with a reason
+tied to updated understanding. A completed investigation does not automatically
+answer its question. Preserve unresolved plans when budgets or review end the run.
+
+Use explicit assessment updates in update_investigation_plan when new evidence
+changes a question status. Investigation completion alone leaves it unchanged.

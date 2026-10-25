@@ -12,9 +12,20 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import JsonValue
 
-from agent_system.company_intelligence.artifacts import read_events, read_json
+from agent_system.company_intelligence.artifacts import (
+    read_events,
+    read_json,
+    source_path,
+)
+from agent_system.company_intelligence.call_traces import (
+    call_details,
+    call_summaries,
+    safe_path,
+)
+from agent_system.company_intelligence.page_content import cleaned_path
+from agent_system.company_intelligence.research_questions import QUESTIONS
 from agent_system.company_intelligence.schemas import Source
-from agent_system.company_intelligence.tools import excerpt
+from agent_system.company_intelligence.site_index import search_inventory
 from agent_system.config import data_directory
 from agent_system.worker import job_id_argument
 
@@ -51,21 +62,82 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "text/html; charset=utf-8",
                 )
                 return
-            if route == "/api/state":
-                dashboard = read_json(self.directory / "dashboard.json")
+            if route in {"/dashboard.css", "/dashboard.js", "/dashboard-timing.js"}:
+                self.send_body(
+                    200,
+                    files("agent_system").joinpath(route[1:]).read_bytes(),
+                    "text/css; charset=utf-8"
+                    if route.endswith("css")
+                    else "text/javascript; charset=utf-8",
+                )
+                return
+            if route == "/api/calls":
+                self.send_json(
+                    200,
+                    call_summaries(
+                        self.directory,
+                        query.get("phase", [""])[0],
+                        query.get("status", [""])[0],
+                        query.get("counts", ["false"])[0] == "true",
+                        int(query.get("offset", ["0"])[0]),
+                    ),
+                )
+            elif route.startswith("/api/call/"):
+                self.send_json(
+                    200, call_details(self.directory, route.removeprefix("/api/call/"))
+                )
+            elif route == "/api/inventory":
+                safe_path(self.directory, "site_index.json")
+                self.send_json(
+                    200,
+                    search_inventory(
+                        self.directory,
+                        query.get("q", [""])[0],
+                        20,
+                        int(query.get("offset", ["0"])[0]),
+                    ),
+                )
+            elif route == "/api/orientation":
+                self.send_json(
+                    200, read_json(safe_path(self.directory, "orientation.json"))
+                )
+            elif route == "/api/state":
+                dashboard = read_json(safe_path(self.directory, "dashboard.json"))
                 records = sorted((self.directory / "investigations").glob("*.json"))[
                     -12:
                 ]
+                issues: list[JsonValue] = []
+
+                def optional_artifact(relative: str, fallback: JsonValue) -> JsonValue:
+                    path = safe_path(self.directory, relative)
+                    try:
+                        return read_json(path)
+                    except (ValueError, OSError):
+                        issues.append(
+                            f"{relative} unavailable or incomplete; displaying saved checkpoint projection where available"
+                        )
+                        return fallback
+
                 self.send_json(
                     200,
                     {
                         "dashboard": dashboard,
-                        "profile": read_json(self.directory / "profile.json"),
-                        "sources": read_json(self.directory / "sources.json"),
-                        "investigations": [read_json(p) for p in records],
+                        "questions": {k: v for k, v in QUESTIONS.items()},
+                        "profile": optional_artifact(
+                            "profile.json", dashboard.get("profile", {})
+                        ),
+                        "sources": optional_artifact(
+                            "sources.json", dashboard.get("sources", {})
+                        ),
+                        "investigations": [
+                            optional_artifact(str(p.relative_to(self.directory)), {})
+                            for p in records
+                        ],
+                        "artifact_errors": issues,
                     },
                 )
             elif route == "/api/events":
+                safe_path(self.directory, "events.jsonl")
                 after = int(query.get("after", ["0"])[0])
                 if after < 0:
                     raise ValueError("after must be nonnegative")
@@ -74,20 +146,53 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
             elif route.startswith("/api/source/"):
                 sid = route.removeprefix("/api/source/")
-                manifest = read_json(self.directory / "sources.json")
+                manifest = read_json(safe_path(self.directory, "sources.json"))
                 if sid not in manifest:
                     self.send_json(404, {"error": "Source not found"})
                     return
                 source = Source.model_validate(manifest[sid])
-                result = excerpt(
-                    self.directory,
-                    source,
-                    int(query.get("start_line", ["1"])[0]),
-                    int(query.get("max_lines", ["200"])[0]),
+                representation = query.get("representation", ["raw"])[0]
+                if representation not in {"raw", "cleaned"}:
+                    raise ValueError("Unknown representation")
+                if source.outcome != "success":
+                    raise ValueError("Source has no successful saved scrape")
+                if representation == "cleaned" and not source.cleaned_filename:
+                    self.send_json(
+                        404,
+                        {
+                            "error": "Cleaned text unavailable for this historical source"
+                        },
+                    )
+                    return
+                path = (
+                    cleaned_path(self.directory, source)
+                    if representation == "cleaned"
+                    else source_path(self.directory, source)
                 )
+                lines = path.read_text(encoding="utf-8").splitlines()
+                start = int(query.get("start_line", ["1"])[0])
+                count = int(query.get("max_lines", ["200"])[0])
+                if start < 1 or not 1 <= count <= 500:
+                    raise ValueError("Invalid source pagination")
+                end = min(len(lines), start + count - 1)
+                result: dict[str, JsonValue] = {
+                    "source_id": sid,
+                    "title": source.title,
+                    "url": source.requested_url,
+                    "representation": representation,
+                    "cleaner_version": source.cleaner_version
+                    if representation == "cleaned"
+                    else None,
+                    "start_line": start,
+                    "end_line": end,
+                    "total_lines": len(lines),
+                    "content": "\n".join(lines[start - 1 : end]),
+                    "more": end < len(lines),
+                    "cleaning_stats": source.model_dump(mode="json")["cleaning_stats"],
+                }
                 self.send_json(200, result)
             elif route == "/api/result":
-                path = self.directory / "result.json"
+                path = safe_path(self.directory, "result.json")
                 self.send_json(
                     200 if path.exists() else 404,
                     read_json(path)
@@ -112,7 +217,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+            "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
         )
         self.end_headers()
         self.wfile.write(body)

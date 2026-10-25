@@ -66,6 +66,11 @@ def display_research(state: "Research") -> int:
         print(f"Limit: {state.limiting_resource}; resume cannot reopen a terminal run")
     if state.error:
         print(f"Error: {state.error}")
+    print(f"Run mode: {state.run_mode}")
+    if state.stop_reason == "orientation_complete":
+        print(
+            "Orientation complete — profile is provisional; investigations have not run."
+        )
     print(f"Readiness: {state.readiness}")
     print(f"Artifacts: {data_directory() / 'jobs' / state.job_id}")
     return 1 if state.status in {"blocked_by_error", "interrupted"} else 0
@@ -81,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     research.add_argument("--url", required=True, type=public_url)
     research.add_argument("--product", required=True, type=company_argument)
     research.add_argument("--product-url", required=True, type=public_url)
+    research.add_argument("--orientation-only", action="store_true")
     research.add_argument("--source-url", action="append", default=[], type=public_url)
     for name in ("status", "resume"):
         command = commands.add_parser(name)
@@ -112,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
                     source_urls=args.source_url,
                 ),
                 settings,
+                run_mode="orientation_only" if args.orientation_only else "full",
             )
             data_dir.mkdir(parents=True, exist_ok=True)
             result = run_research(data_dir, job_id, initial)

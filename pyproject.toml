@@ -1,7 +1,7 @@
 [project]
 name = "agent-system"
 version = "0.1.0"
-description = "Local placeholder workflow with persistent checkpoints"
+description = "Local company intelligence research with persistent checkpoints"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [

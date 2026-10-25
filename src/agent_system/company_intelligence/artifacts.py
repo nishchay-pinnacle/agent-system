@@ -113,6 +113,10 @@ def project(directory: Path, state: Research) -> None:
                 handle.write((json.dumps(item) + "\n").encode())
     profile = {k: v.model_dump(mode="json") for k, v in state.profile.items()}
     sources = {k: v.model_dump(mode="json") for k, v in state.sources.items()}
+    save_json(
+        directory / "investigation_plan.json",
+        {"plan": [p.model_dump(mode="json") for p in state.investigation_plan]},
+    )
     save_json(directory / "profile.json", profile)
     save_json(directory / "sources.json", sources)
     for index, record in enumerate(state.investigations, 1):
@@ -125,6 +129,7 @@ def project(directory: Path, state: Research) -> None:
             "cache",
             "events",
             "orientation_queue",
+            "source_deliveries",
         },
     )
     save_json(directory / "dashboard.json", summary)
@@ -134,6 +139,7 @@ def project(directory: Path, state: Research) -> None:
             {
                 "job_id": state.job_id,
                 "inputs": state.inputs.model_dump(mode="json"),
+                "run_mode": state.run_mode,
                 "stop_reason": state.stop_reason,
                 "limiting_resource": state.limiting_resource,
                 "readiness": state.readiness,
@@ -150,6 +156,10 @@ def project(directory: Path, state: Research) -> None:
                 ],
                 "artifacts": {
                     "profile": "profile.json",
+                    "orientation": "orientation.json",
+                    "plan": "investigation_plan.json",
+                    "site_index": "site_index.json",
+                    "calls": "calls/",
                     "sources": "sources.json",
                     "investigations": "investigations/",
                 },

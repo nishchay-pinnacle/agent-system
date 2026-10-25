@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 SectionKey = Literal[
     "scope",
@@ -47,7 +47,17 @@ class ResearchSettings(StrictModel):
     total_tokens: int = Field(default=500_000, gt=0)
     input_tokens: int = Field(default=48_000, gt=0)
     output_tokens: int = Field(default=6000, gt=0)
+    map_limit: int = Field(default=5000, gt=0)
+    orientation_output_tokens: int = Field(default=12000, gt=0)
     request_seconds: float = Field(default=90, gt=0)
+    generation_request_seconds: float = Field(default=300, gt=0)
+
+    def request_timeout(self, kind: str) -> float:
+        return (
+            self.generation_request_seconds
+            if kind == "generate"
+            else self.request_seconds
+        )
 
 
 class Inputs(StrictModel):
@@ -88,6 +98,8 @@ class Gap(GapUpdate):
 
 
 class Begin(StrictModel):
+    question_id: str | None = None
+    plan_id: str | None = None
     gap_id: str | None
     question: str = Field(min_length=1)
     importance: str = Field(min_length=1)
@@ -111,6 +123,52 @@ class Complete(StrictModel):
     next_source: str | None
     return_question: str | None
     readiness: Literal["ready", "needs_review"]
+
+
+class QuestionAssessment(StrictModel):
+    question_id: str
+    status: Literal["answered", "partial", "unassessed", "not_applicable"]
+    answer: str = Field(min_length=1)
+    source_ids: list[str]
+
+
+class PlannedInvestigation(StrictModel):
+    question_id: str
+    question: str = Field(min_length=1)
+    importance: str = Field(min_length=1)
+    known_evidence: str = Field(min_length=1)
+    source_strategy: str = Field(min_length=1)
+    resolution_criterion: str = Field(min_length=1)
+    priority: int = Field(ge=1, le=5)
+
+
+class PlanEntry(PlannedInvestigation):
+    plan_id: str
+    status: Literal["pending", "in_progress", "completed", "superseded"] = "pending"
+    superseded_reason: str | None = None
+
+
+class OrientationSubmission(StrictModel):
+    sections: list[SectionUpdate]
+    assessments: list[QuestionAssessment]
+    plan: list[PlannedInvestigation]
+    contradictions: list[str]
+
+
+class SupersedePlan(StrictModel):
+    plan_id: str
+    reason: str = Field(min_length=1)
+
+
+class PlanUpdate(StrictModel):
+    assessments: list[QuestionAssessment] = Field(default_factory=list)
+    additions: list[PlannedInvestigation]
+    supersede: list[SupersedePlan]
+
+
+class IndexSearchArgs(StrictModel):
+    query: str = Field(min_length=1)
+    limit: int = Field(default=10, ge=1, le=20)
 
 
 class MapArgs(StrictModel):
@@ -139,6 +197,11 @@ class Source(StrictModel):
     title: str = ""
     fetched_at: str | None = None
     filename: str | None = None
+    cleaned_filename: str | None = None
+    cleaner_version: str | None = None
+    raw_hash: str | None = None
+    cleaned_hash: str | None = None
+    cleaning_stats: dict[str, int] = Field(default_factory=dict)
     outcome: Literal["discovered", "success", "failed"] = "discovered"
 
 
@@ -167,11 +230,42 @@ class Operation(StrictModel):
     reserved_tokens: int = 0
     reserved_seconds: float = 0
     counted_input: int | None = None
+    count_trace_id: str | None = None
 
 
 class Research(StrictModel):
+    @model_validator(mode="before")
+    @classmethod
+    def preserve_legacy_timeout(cls, value: object) -> object:
+        # Old saved jobs had one explicit timeout for every request. Preserve it
+        # when reopening; new jobs persist both independently resolved settings.
+        if isinstance(value, dict):
+            settings = value.get("settings")
+            if (
+                isinstance(settings, dict)
+                and "generation_request_seconds" not in settings
+            ):
+                return {
+                    **value,
+                    "settings": {
+                        **settings,
+                        "generation_request_seconds": settings.get(
+                            "request_seconds", 90
+                        ),
+                    },
+                }
+        return value
+
     job_id: str
     job_type: Literal["research"] = "research"
+    schema_version: int = 1
+    run_mode: Literal["orientation_only", "full"] = "full"
+    orientation_context: str | None = None
+    discovery: dict[str, JsonValue] = Field(default_factory=dict)
+    assessments: list[QuestionAssessment] = Field(default_factory=list)
+    investigation_plan: list[PlanEntry] = Field(default_factory=list)
+    source_deliveries: list[dict[str, JsonValue]] = Field(default_factory=list)
+    last_trace_id: str | None = None
     inputs: Inputs
     settings: ResearchSettings
     instructions: str

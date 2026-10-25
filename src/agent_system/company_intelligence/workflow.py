@@ -7,13 +7,13 @@ import logging
 import time
 from importlib.resources import files
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from pydantic import JsonValue, ValidationError
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from agent_system.company_intelligence.agent import (
     FetchResult,
@@ -21,6 +21,10 @@ from agent_system.company_intelligence.agent import (
     LiveProviders,
     ProviderFailure,
     Providers,
+    counting_kind,
+    counting_payload,
+    output_limit,
+    request_payload,
 )
 from agent_system.company_intelligence.artifacts import (
     event,
@@ -30,16 +34,35 @@ from agent_system.company_intelligence.artifacts import (
     read_json,
     save_json,
 )
+from agent_system.company_intelligence.call_traces import (
+    finish_trace,
+    start_trace,
+    trace_directory,
+    trace_id,
+)
+from agent_system.company_intelligence.orientation import (
+    apply_submission,
+    build_context,
+    update_plan,
+)
+from agent_system.company_intelligence.page_content import CLEANER_VERSION, load_cleaned
 from agent_system.company_intelligence.schemas import (
     Begin,
     Complete,
     Gap,
+    IndexSearchArgs,
     Inputs,
     Operation,
+    OrientationSubmission,
+    PlanUpdate,
     ReadArgs,
     Research,
     ResearchSettings,
     Source,
+)
+from agent_system.company_intelligence.site_index import (
+    save_inventory,
+    search_inventory,
 )
 from agent_system.company_intelligence.tools import (
     RETRIEVALS,
@@ -49,6 +72,8 @@ from agent_system.company_intelligence.tools import (
     source_id,
     tool_definitions,
 )
+
+JSON_MESSAGES = TypeAdapter(list[dict[str, JsonValue]])
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +87,11 @@ class LimitReached(Exception):
 
 
 def initial_research(
-    job_id: str, inputs: Inputs, settings: ResearchSettings
+    job_id: str,
+    inputs: Inputs,
+    settings: ResearchSettings,
+    *,
+    run_mode: Literal["full", "orientation_only"] = "full",
 ) -> Research:
     inputs = inputs.model_copy(deep=True)
     inputs.url = public_url(inputs.url)
@@ -74,7 +103,12 @@ def initial_research(
         .read_text()
     )
     state = Research(
-        job_id=job_id, inputs=inputs, settings=settings, instructions=instructions
+        job_id=job_id,
+        inputs=inputs,
+        settings=settings,
+        instructions=instructions,
+        schema_version=2,
+        run_mode=run_mode,
     )
     urls = list(dict.fromkeys([inputs.url, inputs.product_url]))
     state.orientation_queue = [
@@ -85,14 +119,13 @@ def initial_research(
         Operation(
             operation_id="",
             kind="find_site_pages",
-            args={"url": inputs.url, "query": ""},
+            args={"url": inputs.url, "query": "", "limit": settings.map_limit},
         )
     )
     for url in inputs.source_urls:
         sid = source_id(url)
         state.sources[sid] = Source(source_id=sid, requested_url=url)
-    state.messages = context(state)
-    event(state, "phase_change", summary="Research started: bounded orientation")
+    event(state, "phase_change", summary="Research started: full-page orientation")
     return state
 
 
@@ -102,6 +135,8 @@ def context(state: Research) -> list[dict[str, JsonValue]]:
         include={
             "inputs",
             "profile",
+            "investigation_plan",
+            "assessments",
             "gaps",
             "current",
             "phase",
@@ -137,7 +172,9 @@ def operation(
 
 def cache_key(op: Operation) -> str:
     return hashlib.sha256(
-        json.dumps([op.kind, op.args], sort_keys=True).encode()
+        json.dumps(
+            [op.kind, op.args, "cleaned", CLEANER_VERSION], sort_keys=True
+        ).encode()
     ).hexdigest()
 
 
@@ -158,12 +195,15 @@ def stop(state: Research, reason: str, resource: str | None = None) -> None:
     event(state, "completion", summary=reason, limiting_resource=resource)
 
 
-def plan(state: Research) -> None:
+def plan(state: Research, directory: Path) -> None:
     if state.orientation_queue:
         queued = state.orientation_queue.pop(0)
         operation(state, queued.kind, queued.args)
         return
-    if not state.messages:
+    if state.phase == "orientation" and state.schema_version >= 2:
+        if state.orientation_context is None:
+            build_context(state, directory)
+    elif not state.messages:
         state.messages = context(state)
     operation(state, "count_input")
 
@@ -212,6 +252,32 @@ def reserve(state: Research, directory: Path) -> None:
         )
         tool_result(state, state.cache[cache_key(op)])
         return
+    if op.kind == "search_site_index":
+        args_index = IndexSearchArgs.model_validate(op.args)
+        result_index = search_inventory(directory, args_index.query, args_index.limit)
+        entries = result_index.get("entries", [])
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict):
+                    sid = str(entry["source_id"])
+                    state.sources.setdefault(
+                        sid,
+                        Source(
+                            source_id=sid,
+                            requested_url=str(entry["url"]),
+                            title=str(entry.get("title", "")),
+                        ),
+                    )
+        event(state, "tool_end", tool=op.kind, result=result_index)
+        tool_result(state, result_index)
+        return
+    if op.kind == "scrape_page" and not (
+        state.phase == "orientation" and state.orientation_queue
+    ):
+        saved_source = state.sources.get(source_id(str(op.args["url"])))
+        if saved_source and saved_source.outcome == "success":
+            tool_result(state, excerpt(directory, saved_source))
+            return
     if op.kind == "read_source":
         args = ReadArgs.model_validate(op.args)
         source = state.sources.get(args.source_id)
@@ -235,8 +301,13 @@ def reserve(state: Research, directory: Path) -> None:
         else:
             assert op.counted_input is not None
             if op.counted_input > state.settings.input_tokens:
-                raise LimitReached("context_size")
-            allowance = op.counted_input + state.settings.output_tokens
+                state.error = (
+                    "Full orientation content exceeded the input token cap"
+                    if state.phase == "orientation"
+                    else "Input exceeded the token cap"
+                )
+                raise LimitReached("input_tokens")
+            allowance = op.counted_input + output_limit(state)
             if (
                 state.usage.input_tokens
                 + state.usage.output_tokens
@@ -256,7 +327,7 @@ def reserve(state: Research, directory: Path) -> None:
         state.usage.firecrawl_requests += 1
     op.attempts += 1
     op.reserved_seconds = min(
-        state.settings.request_seconds,
+        state.settings.request_timeout(op.kind),
         state.settings.active_seconds - state.usage.active_seconds,
     )
     state.usage.active_seconds += op.reserved_seconds
@@ -285,25 +356,88 @@ def execute(state: Research, directory: Path, providers: Providers | None) -> No
     if path.exists():
         state.stage = "consume"
         return
-    boundary = providers or LiveProviders()
+    identifier: str | None = None
+    supplied = state.model_copy(deep=True)
+    if (
+        state.schema_version >= 2
+        and state.phase == "orientation"
+        and state.orientation_context
+    ):
+        context_file = read_json(directory / "orientation_context.json")
+        supplied.messages = (
+            JSON_MESSAGES.validate_python(context_file["messages"]) + supplied.messages
+        )
+    if op.kind in {"count_input", "generate"}:
+        request = request_payload(supplied)
+        kind = (
+            "generation"
+            if op.kind == "generate"
+            else counting_kind(state.settings.model)
+        )
+        if op.kind == "count_input":
+            request = counting_payload(request)
+        identifier = start_trace(directory, state, request, kind, providers is not None)
+    boundary = providers or LiveProviders(directory, identifier)
     start = time.monotonic()
     try:
         if op.kind == "count_input":
             # Count the full Responses input including schemas and protocol items.
+            counted_input = boundary.count_input(supplied, op.reserved_seconds)
             result: dict[str, JsonValue] = {
-                "input_tokens": boundary.count_input(state, op.reserved_seconds) + 1024
+                "input_tokens": counted_input + 1024,
+                "counted_input": counted_input,
+                "overhead_tokens": 1024,
             }
         elif op.kind == "generate":
             result = Generation.model_dump(
-                boundary.generate(state, op.reserved_seconds), mode="json"
+                boundary.generate(supplied, op.reserved_seconds), mode="json"
             )
         else:
             result = FetchResult.model_dump(
                 boundary.retrieve(op.kind, op.args, op.reserved_seconds), mode="json"
             )
+        if identifier:
+            raw_response = result.get("raw_response")
+            if op.kind == "count_input":
+                response_path = trace_directory(directory, identifier) / "response.json"
+                raw_response = (
+                    read_json(response_path)
+                    if response_path.exists()
+                    else {"input_tokens": result["counted_input"], "kind": kind}
+                )
+            finish_trace(
+                directory,
+                identifier,
+                response=raw_response if isinstance(raw_response, dict) else result,
+                status=str(result.get("status", "completed")),
+                duration=time.monotonic() - start,
+                application_status="accepted"
+                if op.kind == "count_input"
+                else "pending",
+                usage={
+                    key: result.get(key)
+                    for key in (
+                        "input_tokens",
+                        "output_tokens",
+                        "cached_tokens",
+                        "reasoning_tokens",
+                    )
+                }
+                if op.kind == "generate"
+                else {},
+            )
         save_json(path, {"result": result, "duration": time.monotonic() - start})
         state.stage = "consume"
     except ProviderFailure as exc:
+        if identifier:
+            finish_trace(
+                directory,
+                identifier,
+                status="failed",
+                application_status="not_evaluated",
+                error=str(exc),
+                duration=time.monotonic() - start,
+            )
         elapsed = time.monotonic() - start
         state.usage.active_seconds += elapsed - op.reserved_seconds
         op.reserved_seconds = 0
@@ -324,8 +458,14 @@ def execute(state: Research, directory: Path, providers: Providers | None) -> No
 def tool_result(state: Research, result: JsonValue) -> None:
     op = state.operation
     assert op is not None
-    if op.kind in RETRIEVALS:
+    if op.kind in RETRIEVALS and not (
+        state.schema_version >= 2 and state.phase == "orientation" and not op.call_id
+    ):
         state.cache[cache_key(op)] = result
+    if isinstance(result, dict) and result.get("representation") == "cleaned":
+        state.source_deliveries.append(
+            {k: v for k, v in result.items() if k not in {"content", "heading_index"}}
+        )
     if op.call_id:
         state.messages.append(
             {
@@ -334,7 +474,7 @@ def tool_result(state: Research, result: JsonValue) -> None:
                 "output": json.dumps(result),
             }
         )
-    else:
+    elif state.schema_version < 2:
         # Orientation fetches precede the first model conversation.
         state.messages.append(
             {"role": "user", "content": json.dumps({"orientation_evidence": result})}
@@ -356,6 +496,7 @@ def consume(state: Research, directory: Path) -> None:
         "model_request_end" if op.kind in {"generate", "count_input"} else "tool_end",
         tool=op.kind,
         operation_id=op.operation_id,
+        attempt=op.attempts,
         duration=duration,
     )
     if op.kind == "count_input":
@@ -365,8 +506,10 @@ def consume(state: Research, directory: Path) -> None:
         operation(state, "generate")
         assert state.operation is not None
         state.operation.counted_input = counted
+        state.operation.count_trace_id = trace_id(op)
         return
     if op.kind == "generate":
+        state.last_trace_id = trace_id(op)
         response = Generation.model_validate(result)
         if response.input_tokens is None or response.output_tokens is None:
             state.usage.unknown_requests.append(op.operation_id)
@@ -415,7 +558,28 @@ def consume(state: Research, directory: Path) -> None:
             if name not in available:
                 raise ValueError("Tool unavailable in this phase")
             parsed = TOOL_MODELS[name].model_validate_json(raw)
-            if name == "begin_investigation":
+            if name == "complete_orientation":
+                apply_submission(
+                    state,
+                    OrientationSubmission.model_validate(parsed.model_dump()),
+                    directory,
+                )
+                state.messages = []
+                state.source_deliveries = []
+                if state.run_mode == "orientation_only":
+                    state.readiness = "needs_review"
+                    stop(state, "orientation_complete")
+                else:
+                    state.phase = "between"
+                    event(
+                        state,
+                        "phase_change",
+                        summary="Orientation complete; provisional profile and plan saved",
+                    )
+            elif name == "update_investigation_plan":
+                update_plan(state, PlanUpdate.model_validate(parsed.model_dump()))
+                state.messages = context(state)
+            elif name == "begin_investigation":
                 begin(state, Begin.model_validate(parsed.model_dump()))
             elif name == "complete_investigation":
                 complete(state, Complete.model_validate(parsed.model_dump()))
@@ -423,6 +587,8 @@ def consume(state: Research, directory: Path) -> None:
                 arguments = parsed.model_dump(mode="json")
                 if name in {"find_site_pages", "scrape_page"}:
                     arguments["url"] = public_url(str(arguments["url"]))
+                    if name == "find_site_pages":
+                        arguments["limit"] = state.settings.map_limit
                 if (
                     name == "read_source"
                     and arguments["source_id"] not in state.sources
@@ -449,10 +615,12 @@ def consume(state: Research, directory: Path) -> None:
     if op.kind == "scrape_page":
         url = str(op.args["url"])
         sid = source_id(url)
-        if not fetched.markdown:
+        if not fetched.markdown or not fetched.markdown.strip():
             state.sources[sid] = Source(
                 source_id=sid, requested_url=url, outcome="failed"
             )
+            if state.schema_version >= 2 and state.phase == "orientation":
+                raise ValueError("Required orientation page returned no content")
             tool_result(
                 state,
                 {
@@ -464,7 +632,7 @@ def consume(state: Research, directory: Path) -> None:
         source = Source(
             source_id=sid,
             requested_url=url,
-            final_url=fetched.final_url,
+            final_url=public_url(fetched.final_url) if fetched.final_url else None,
             title=fetched.title,
             fetched_at=now(),
             filename=f"sources/{sid}.md",
@@ -478,8 +646,23 @@ def consume(state: Research, directory: Path) -> None:
             temporary.replace(target)
         state.sources[sid] = source
         state.usage.pages += 1
-        result = excerpt(directory, source)
+        cleaned = load_cleaned(directory, source)
+        if state.schema_version >= 2 and state.phase == "orientation":
+            if not cleaned.strip():
+                raise ValueError("Required orientation page has empty cleaned content")
+            result = {"source_id": sid, "saved": True}
+        else:
+            result = excerpt(directory, source)
         event(state, "source_fetch", source_id=sid, result=result)
+    elif op.kind == "find_site_pages":
+        state.discovery = save_inventory(
+            directory, fetched.candidates, op.operation_id, state.settings.map_limit
+        )
+        result = state.discovery
+        save_json(
+            directory / "discoveries" / f"{op.operation_id}.json",
+            fetched.model_dump(mode="json"),
+        )
     else:
         candidates: list[JsonValue] = []
         for candidate in fetched.candidates:
@@ -539,6 +722,19 @@ def begin(state: Research, args: Begin) -> None:
         raise ValueError("Begin is only legal between investigations")
     if state.completed_investigations >= state.settings.investigations:
         raise LimitReached("investigations")
+    selected_plan = None
+    if state.assessments:
+        selected_plan = next(
+            (p for p in state.investigation_plan if p.plan_id == args.plan_id), None
+        )
+        if (
+            selected_plan is None
+            or selected_plan.status != "pending"
+            or args.question_id != selected_plan.question_id
+        ):
+            raise ValueError(
+                "Begin must select a pending plan and its question ID; add a focused plan first for newly revealed gaps"
+            )
     gap = (
         next((g for g in state.gaps if g.gap_id == args.gap_id), None)
         if args.gap_id
@@ -575,6 +771,9 @@ def begin(state: Research, args: Begin) -> None:
     if args.reopen_reason:
         gap.history.append("Reopened: " + args.reopen_reason)
     args.gap_id = gap.gap_id
+    if selected_plan:
+        selected_plan.status = "in_progress"
+    state.source_deliveries = []
     state.current = args
     state.phase = "investigation"
     state.investigation_retrievals = 0
@@ -665,6 +864,10 @@ def complete(state: Research, args: Complete) -> None:
         contradictions=[s for s in args.contradictions],
     )
     if state.phase == "investigation":
+        if state.current and state.current.plan_id:
+            for entry in state.investigation_plan:
+                if entry.plan_id == state.current.plan_id:
+                    entry.status = "completed"
         state.completed_investigations += 1
         state.no_progress = 0 if args.meaningful_change else state.no_progress + 1
         gap = next(
@@ -701,6 +904,7 @@ def complete(state: Research, args: Complete) -> None:
     else:
         state.phase = "between"
     state.current = None
+    state.source_deliveries = []
     state.messages = []
     state.operation = None
     state.stage = "plan"
@@ -715,7 +919,7 @@ def transition(
     started = time.monotonic()
     try:
         if state.stage == "plan":
-            plan(state)
+            plan(state, directory)
         elif state.stage == "reserve":
             reserve(state, directory)
         elif state.stage == "execute":
@@ -737,6 +941,51 @@ def transition(
         state.error = f"{type(exc).__name__}: {str(exc)[:800]}"
         state.stage = "halt"
         event(state, "error", summary=state.error)
+    if (
+        before.stage == "consume"
+        and before.operation
+        and before.operation.kind == "generate"
+    ):
+        identifier = trace_id(before.operation)
+        correction_events = state.events[len(before.events) :]
+        issue = next(
+            (
+                str(e.get("summary"))
+                for e in correction_events
+                if e.get("kind") == "correction"
+            ),
+            state.error,
+        )
+        output_items = read_json(receipt_path(directory, before.operation)).get(
+            "result"
+        )
+        action = None
+        if isinstance(output_items, dict):
+            outputs = output_items.get("output", [])
+            if isinstance(outputs, list):
+                action = next(
+                    (
+                        str(item.get("name"))
+                        for item in outputs
+                        if isinstance(item, dict)
+                        and item.get("type") == "function_call"
+                    ),
+                    None,
+                )
+        outcome: dict[str, JsonValue] = {
+            "status": "rejected" if issue else "accepted",
+            "error": issue,
+        }
+        target = trace_directory(directory, identifier)
+        if (target / "metadata.json").exists():
+            save_json(target / "application.json", outcome)
+            finish_trace(
+                directory,
+                identifier,
+                application_status=outcome["status"],
+                validation_issue=issue,
+                action=action,
+            )
     if before.stage in {"plan", "reserve", "consume"}:
         state.usage.active_seconds += time.monotonic() - started
     return {"research": state.model_dump(mode="json")}

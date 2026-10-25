@@ -242,7 +242,10 @@ def test_dashboard_and_boundaries(tmp_path: Path) -> None:
         assert get("/api/result")["stop_reason"] == "public_sources_exhausted"
         with urlopen(base, timeout=5) as response:
             html = response.read().decode()
-        assert "textContent" in html and "innerHTML" not in html
+        assert "/dashboard.js" in html
+        with urlopen(base + "/dashboard.js", timeout=5) as response:
+            javascript = response.read().decode()
+        assert "textContent" in javascript and "innerHTML" not in javascript
         for path in (
             "/api/source/../../.env",
             "/api/source/%2e%2e%2f.env",

@@ -2,19 +2,29 @@
 
 import json
 import os
+from pathlib import Path
 from typing import Protocol
 
 import tiktoken
 from firecrawl.v2.client import FirecrawlClient
 from openai import APIConnectionError, APIStatusError, OpenAI
 from openai.types.responses import ResponseInputItemParam
+from openai.types.responses.input_token_count_params import InputTokenCountParams
+from openai.types.responses.response_create_params import (
+    ResponseCreateParamsNonStreaming,
+)
 from pydantic import BaseModel, Field, JsonValue, TypeAdapter
 from requests.exceptions import RequestException
 
+from agent_system.company_intelligence.artifacts import read_json
+from agent_system.company_intelligence.call_traces import finish_trace
 from agent_system.company_intelligence.schemas import Research
 from agent_system.company_intelligence.tools import public_url, tool_definitions
 
 INPUT_ITEMS = TypeAdapter(list[ResponseInputItemParam])
+# Keep adapters alive while materializing SDK iterable validators.
+CREATE_PARAMS = TypeAdapter(ResponseCreateParamsNonStreaming)
+COUNT_PARAMS = TypeAdapter(InputTokenCountParams)
 JSON_ITEMS = TypeAdapter(list[dict[str, JsonValue]])
 
 
@@ -31,6 +41,7 @@ class Generation(BaseModel):
     reasoning_tokens: int = 0
     cached_tokens: int | None = None
     status: str = "completed"
+    raw_response: dict[str, JsonValue] | None = None
 
 
 class FetchResult(BaseModel):
@@ -59,65 +70,132 @@ def validate_credentials() -> None:
         raise ValueError("Missing configuration: " + ", ".join(missing))
 
 
+def output_limit(state: Research) -> int:
+    return (
+        state.settings.orientation_output_tokens
+        if state.schema_version >= 2 and state.phase == "orientation"
+        else state.settings.output_tokens
+    )
+
+
+def request_payload(state: Research) -> dict[str, JsonValue]:
+    return {
+        "model": state.settings.model,
+        "instructions": state.instructions,
+        "input": [m for m in state.messages],
+        "tools": [t for t in JSON_ITEMS.validate_python(tool_definitions(state))],
+        "parallel_tool_calls": False,
+        "tool_choice": "required",
+        "max_output_tokens": output_limit(state),
+        "reasoning": {"effort": state.settings.effort},
+        "store": False,
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": "company-intelligence-v1",
+        "truncation": "disabled",
+    }
+
+
+def counting_payload(request: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    return {
+        key: value
+        for key, value in request.items()
+        if key
+        in {
+            "model",
+            "instructions",
+            "input",
+            "tools",
+            "parallel_tool_calls",
+            "tool_choice",
+            "reasoning",
+            "truncation",
+        }
+    }
+
+
+def counting_kind(model: str) -> str:
+    try:
+        tiktoken.encoding_name_for_model(model)
+    except KeyError:
+        return "remote_count"
+    return "local_count"
+
+
 class LiveProviders:
-    def __init__(self) -> None:
+    def __init__(
+        self, directory: Path | None = None, identifier: str | None = None
+    ) -> None:
         validate_credentials()
+        self.directory = directory
+        self.identifier = identifier
+
+    def payload(self) -> dict[str, JsonValue]:
+        if self.directory is None or self.identifier is None:
+            raise ValueError("Live model requests require a durable request snapshot")
+        return read_json(self.directory / "calls" / self.identifier / "request.json")
 
     def count_input(self, state: Research, timeout: float) -> int:
+        request = self.payload()
         try:
-            # Use only official model mappings. Unknown models (including the
-            # current default) use the documented server counting endpoint.
-            try:
-                tiktoken.encoding_name_for_model(state.settings.model)
-            except KeyError:
-                pass
-            else:
+            if counting_kind(state.settings.model) == "local_count":
                 encoding = tiktoken.encoding_for_model(state.settings.model)
-                payload = json.dumps(
-                    {
-                        "instructions": state.instructions,
-                        "input": state.messages,
-                        "tools": tool_definitions(state),
-                    }
-                )
-                # UTF-8 bytes provide a conservative BPE upper bound; request
-                # framing receives another 1024 tokens in the workflow.
+                payload = json.dumps(request)
                 return max(
                     len(encoding.encode(payload, disallowed_special=())),
                     len(payload.encode()),
                 )
             with OpenAI(max_retries=0) as client:
+                counted_request = COUNT_PARAMS.validate_python(request)
+                if counted_request.get("tools") is not None:
+                    counted_request["tools"] = list(counted_request["tools"] or [])
+                items = counted_request.get("input")
+                if items is not None and not isinstance(items, str):
+                    counted_request["input"] = list(items)
                 result = client.responses.input_tokens.count(
-                    model=state.settings.model,
-                    instructions=state.instructions,
-                    input=INPUT_ITEMS.validate_python(state.messages),
-                    tools=tool_definitions(state),
-                    parallel_tool_calls=False,
-                    reasoning={"effort": state.settings.effort},
-                    tool_choice="required",
-                    timeout=timeout,
+                    **counted_request, timeout=timeout
                 )
+                if self.directory is not None and self.identifier is not None:
+                    finish_trace(
+                        self.directory,
+                        self.identifier,
+                        response=result.model_dump(mode="json"),
+                        status="completed",
+                    )
                 return result.input_tokens
         except (APIConnectionError, APIStatusError) as exc:
+            if (
+                isinstance(exc, APIStatusError)
+                and self.directory is not None
+                and self.identifier is not None
+            ):
+                finish_trace(
+                    self.directory,
+                    self.identifier,
+                    response={
+                        "status_code": exc.status_code,
+                        "error": TypeAdapter(JsonValue).validate_python(exc.body),
+                    },
+                    status="failed",
+                )
             raise openai_failure(exc) from exc
 
     def generate(self, state: Research, timeout: float) -> Generation:
+        request = CREATE_PARAMS.validate_python(self.payload())
+        request["tools"] = list(request.get("tools", []))
+        items = request.get("input")
+        if items is not None and not isinstance(items, str):
+            request["input"] = list(items)
         try:
             with OpenAI(max_retries=0) as client:
-                response = client.responses.create(
-                    model=state.settings.model,
-                    instructions=state.instructions,
-                    input=INPUT_ITEMS.validate_python(state.messages),
-                    tools=tool_definitions(state),
-                    parallel_tool_calls=False,
-                    tool_choice="required",
-                    max_output_tokens=state.settings.output_tokens,
-                    reasoning={"effort": state.settings.effort},
-                    store=False,
-                    include=["reasoning.encrypted_content"],
-                    prompt_cache_key="company-intelligence-v1",
-                    timeout=timeout,
-                )
+                response = client.responses.create(**request, timeout=timeout)
+                raw = response.model_dump(mode="json")
+                if self.directory is not None and self.identifier is not None:
+                    finish_trace(
+                        self.directory,
+                        self.identifier,
+                        response=raw,
+                        status=response.status or "unknown",
+                    )
                 usage = response.usage
                 return Generation(
                     output=JSON_ITEMS.validate_python(
@@ -135,8 +213,23 @@ class LiveProviders:
                     if usage and usage.input_tokens_details
                     else None,
                     status=response.status or "unknown",
+                    raw_response=raw,
                 )
         except (APIConnectionError, APIStatusError) as exc:
+            if (
+                isinstance(exc, APIStatusError)
+                and self.directory is not None
+                and self.identifier is not None
+            ):
+                finish_trace(
+                    self.directory,
+                    self.identifier,
+                    response={
+                        "status_code": exc.status_code,
+                        "error": TypeAdapter(JsonValue).validate_python(exc.body),
+                    },
+                    status="failed",
+                )
             raise openai_failure(exc) from exc
 
     def retrieve(
@@ -173,9 +266,10 @@ class LiveProviders:
             if name == "find_site_pages":
                 mapped = client.map(
                     public_url(str(args["url"]), resolve=True),
-                    search=str(args["query"]),
+                    search=str(args.get("query") or "") or None,
+                    sitemap="include",
                     include_subdomains=True,
-                    limit=20,
+                    limit=int(str(args.get("limit", 5000))),
                     timeout=milliseconds,
                 )
                 return FetchResult(
@@ -185,7 +279,7 @@ class LiveProviders:
                             "title": link.title or "",
                             "description": link.description or "",
                         }
-                        for link in mapped.links[:20]
+                        for link in mapped.links
                     ]
                 )
             searched = client.search(str(args["query"]), limit=5, timeout=milliseconds)

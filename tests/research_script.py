@@ -5,7 +5,13 @@ import sys
 from pathlib import Path
 
 from agent_system.company_intelligence.agent import FetchResult, Generation
-from agent_system.company_intelligence.schemas import Inputs, Research, ResearchSettings
+from agent_system.company_intelligence.research_questions import QUESTIONS
+from agent_system.company_intelligence.schemas import (
+    SECTION_KEYS,
+    Inputs,
+    Research,
+    ResearchSettings,
+)
 from agent_system.company_intelligence.tools import source_id
 from agent_system.company_intelligence.workflow import initial_research, run_research
 
@@ -51,6 +57,44 @@ def completion(
     }
 
 
+def orientation_submission() -> dict[str, object]:
+    return {
+        "sections": [
+            {
+                "key": key,
+                "coverage": "answered" if key == "scope" else "partial",
+                "content": "ExampleCo Widget routes support requests."
+                if key == "scope"
+                else "Overview evidence is incomplete; targeted reading is required.",
+                "source_ids": [SID],
+            }
+            for key in SECTION_KEYS
+        ],
+        "assessments": [
+            {
+                "question_id": key,
+                "status": "partial",
+                "answer": "Overview describes routing; this question needs targeted evidence.",
+                "source_ids": [SID],
+            }
+            for key in QUESTIONS
+        ],
+        "plan": [
+            {
+                "question_id": key,
+                "question": question,
+                "importance": "Clarifies downstream campaign claims",
+                "known_evidence": "Overview provides only general routing evidence",
+                "source_strategy": "Search saved inventory for product documentation and customer examples",
+                "resolution_criterion": "Specific evidence or documented source exhaustion",
+                "priority": 1 if key.startswith(("S", "C")) else 3,
+            }
+            for key, question in QUESTIONS.items()
+        ],
+        "contradictions": [],
+    }
+
+
 def begin_args() -> dict[str, object]:
     return {
         "gap_id": "g_001",
@@ -70,6 +114,8 @@ class ScriptedProviders:
         self.fetches = 0
 
     def count_input(self, state: Research, timeout: float) -> int:
+        if self.mode == "orientation_pause" and state.phase == "orientation":
+            raise KeyboardInterrupt
         if (
             self.mode == "pause"
             and state.completed_investigations == 1
@@ -87,11 +133,14 @@ class ScriptedProviders:
             name, args = "complete_investigation", {"invalid": True}
         elif state.phase == "orientation":
             name, args = (
-                "complete_investigation",
-                completion("orientation", "investigate"),
+                "complete_orientation",
+                orientation_submission(),
             )
         elif state.phase == "between":
             name, args = "begin_investigation", begin_args()
+            args["gap_id"] = state.gaps[0].gap_id if state.gaps else None
+            plan = next(p for p in state.investigation_plan if p.status == "pending")
+            args["plan_id"], args["question_id"] = plan.plan_id, plan.question_id
         elif state.phase == "investigation":
             has_tool = any(
                 m.get("type") == "function_call_output" for m in state.messages
@@ -163,8 +212,9 @@ def main() -> None:
             job_id,
             Inputs(company="ExampleCo", url=URL, product="Widget", product_url=URL),
             ResearchSettings(),
+            run_mode="orientation_only" if mode == "orientation_pause" else "full",
         )
-        if mode == "pause"
+        if mode in {"pause", "orientation_pause"}
         else None
     )
     result = run_research(root, job_id, initial, ScriptedProviders(root, mode))

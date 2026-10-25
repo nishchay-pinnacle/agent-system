@@ -2,8 +2,9 @@
 
 A local, synchronous application for researching **one campaign product** from
 public web pages. LangGraph and SQLite save progress between model/tool steps;
-JSON and original Markdown stay on disk. A separate read-only dashboard displays
-saved events, sources, coverage, findings, gaps, usage and results.
+JSON, original and cleaned Markdown, discovery inventory, and exact call snapshots
+stay on disk. A read-only workbench displays calls, sources, question coverage,
+focused investigation plans, findings, gaps, usage and results.
 
 ## Setup
 
@@ -47,9 +48,12 @@ uv run python -m agent_system.dashboard --job <job_id> --port 8765
 Open `http://127.0.0.1:8765`. The standard-library server binds only to loopback,
 polls saved files every 2 seconds, exposes explicit job-scoped GET routes, and
 never calls providers or changes research. It remains useful after the worker exits.
-Select sources to inspect saved text, expand timeline entries for tool arguments,
-delivered line ranges and usage, and copy profile/result JSON. Source content is
-escaped text. A stale saved `running` status is labeled “no recent activity,” not
+Calls is the default view: select an attempt, then inspect Overview, Input, Output
+and JSON. Full prompts load on demand; count operations are an optional filter.
+Profile & Plan shows the eight sections, 49 questions and focused backlog. Sources
+separates fetched evidence (Raw/Cleaned line coordinates) from paginated inventory
+search. Activity retains saved events. Copy controls expose profile/result and
+request/response inspection JSON. All page/provider text is escaped. A stale saved `running` status is labeled “no recent activity,” not
 proof of a live worker. Reading saved runs requires no internet access.
 
 ```bash
@@ -67,8 +71,13 @@ same limits. Exhausted attempts remain blocked. Unknown IDs fail clearly.
 
 ## Research behavior and stop meanings
 
-Orientation scrapes company/product URLs (deduplicated), maps the site, and allows
-one extra overview scrape. Targeted investigations name a question, consequence,
+Orientation scrapes company/product URLs (deduplicated), cleans their full content,
+and maps the site before one normally sufficient model submission. It has no
+exploration tools. The full cleaned pages, fixed question catalog, small discovery
+summary and limits form the input; the inventory stays on disk. If this complete
+request exceeds the input cap, the run stops with `limiting_resource=input_tokens`
+before generation; content is never silently shortened. Missing or empty required
+pages block orientation visibly. Targeted investigations name a question, consequence,
 source strategy and resolution criterion. The eight profile sections cover scope,
 capabilities, problems/use cases, customer fit, people/roles, buying decisions,
 distinctive expertise and customer language. Claims cite successfully saved sources;
@@ -83,6 +92,7 @@ without carrying the entire prior transcript. Within an investigation, full
 Responses protocol items (including encrypted reasoning items) are replayed locally;
 private reasoning is never shown on the dashboard.
 
+- `orientation_complete`: orientation-only run completed; profile remains provisional.
 - `sufficient_understanding`: final review considers understanding sufficient.
 - `public_sources_exhausted`: final review identifies limits of accessible evidence.
 - `budget_reached`: terminal partial result; `limiting_resource` names the cap.
@@ -106,7 +116,10 @@ reopened by resume. Missing coverage is retained rather than filled with inventi
 | Total input + output tokens | 500000 | `AGENT_SYSTEM_TOTAL_TOKENS` |
 | Input tokens per generation | 48000 | `AGENT_SYSTEM_INPUT_TOKENS` |
 | Maximum output tokens per generation | 6000 | `AGENT_SYSTEM_OUTPUT_TOKENS` |
-| Individual request timeout, seconds | 90 | `AGENT_SYSTEM_REQUEST_SECONDS` |
+| Orientation maximum output tokens | 12000 | `AGENT_SYSTEM_ORIENTATION_OUTPUT_TOKENS` |
+| Site map candidate limit | 5000 | `AGENT_SYSTEM_MAP_LIMIT` |
+| Firecrawl and token-count timeout, seconds | 90 | `AGENT_SYSTEM_REQUEST_SECONDS` |
+| Model generation timeout, seconds | 300 | `AGENT_SYSTEM_GENERATION_REQUEST_SECONDS` |
 
 Limits are starting safeguards, not quality guarantees or exact billing. SDK retries
 are disabled (including Firecrawl's scrape auto-resume polling). Requests reserve
@@ -123,7 +136,7 @@ conservative overhead. If counting is unavailable, research blocks before the ne
 generation; the cap is never skipped. Known tiktoken model mappings may use a
 conservative local tokenizer/UTF-8 byte upper bound plus the same overhead. Counting
 attempts have a separate bound of `2 * generation_limit + 2` and are displayed.
-Source excerpts use a conservative 3500-byte ceiling (therefore at most 3500
+Investigation/review excerpts use cleaned content with a conservative 3500-byte ceiling (therefore at most 3500
 byte-BPE tokens), at most 200 lines, with explicit omissions and heading/line index.
 Extremely long individual lines may be partially delivered; original text is saved.
 
@@ -145,7 +158,16 @@ connections are created during imports. This is the editable local `uv sync` set
 
 - `checkpoints.sqlite`: authoritative LangGraph workflow state.
 - `jobs/<job_id>/sources/<source_id>.md`: original fetched Markdown.
-- `sources.json`, `profile.json`: source manifest and current eight-section profile.
+- `sources/<source_id>.cleaned.md`: deterministic cleaned copy, separate from raw.
+- `sources.json`, `profile.json`: source manifest with representation, cleaner version,
+  SHA-256 hashes and byte/line statistics; current eight-section profile.
+- `site_index.json`: normalized discovery leads, provenance and completeness summary.
+- `orientation_context.json`: full orientation context, referenced rather than embedded
+  in checkpoints; reused through corrections/retries.
+- `orientation.json`: original provisional profile, 49 assessments and focused plan.
+- `investigation_plan.json`: current backlog statuses, projected from checkpoints.
+- `calls/<operation>_<attempt>/`: durable request, response, metadata and parsed
+  application outcome. Full trace payloads never enter subsequent model context.
 - `investigations/*.json`: concise phase findings and investigation history.
 - `events.jsonl`: append-only, increasing event sequences (partial trailing lines recover).
 - `dashboard.json`: atomic projection derived from checkpointed state.
@@ -201,3 +223,101 @@ Official API references checked for this implementation:
 File uploads, private/internal sources, PDFs, transcription, browser automation,
 interviews and other future research modules remain unsupported. Those needs belong
 in unresolved gaps/interview follow-ups. No deployment or paid run is part of setup.
+
+## Orientation-only mode and plans
+
+To stop after orientation (this command uses real, potentially paid providers):
+
+```bash
+uv run python -m agent_system.worker research \
+  --company "ExampleCo" --url "https://example.com" \
+  --product "Product name" --product-url "https://example.com/product" \
+  --orientation-only
+uv run python -m agent_system.dashboard --job <printed_job_id> --port 8765
+```
+
+Omit `--orientation-only` for a full research run. Mode is saved with the job;
+resuming retains it. Completed orientation-only jobs do not run investigations or
+convert to full runs. Their banner explicitly identifies a provisional profile.
+
+All 49 question IDs must appear exactly once. Partial/unassessed questions require
+at least one focused plan, with one question ID per plan; multiple plans may address
+one question. Application-assigned plan IDs remain stable. Full runs must select
+pending plans when starting investigations. A separate explicit, evidence-validated
+assessment update changes question status; finishing an investigation does not.
+Newly revealed gaps can add plans; superseding requires an explanation. The original
+orientation snapshot stays unchanged while checkpointed assessment/backlog statuses
+advance. Planned count is independent of the execution allowance, which remains 12
+by default. Unfinished plans remain visible when the run stops.
+
+Mapping includes subdomains and sitemap discovery supported by Firecrawl 4.54.0.
+It discovers leads without scraping them. Reaching the requested cap marks the
+inventory possibly truncated; fewer results still do not establish completeness.
+`search_site_index(query, limit)` searches saved URL/title/description deterministically
+(limit 1–20, default 10); it consumes retrieval allowance, not Firecrawl allowance.
+User-supplied extra URLs remain leads during orientation. Web/map fallback remains
+available in investigations.
+
+Cleaning is versioned and conservative: normalize line endings/NULs, remove complete
+script/style blocks and HTML comments outside fenced code, and collapse excessive
+blank lines outside code. It preserves substantive prose, links, image alt text,
+tables, caveats and examples. It does not promise universal cookie/navigation removal.
+Only orientation bypasses the normal excerpt limits. Statistics are bytes/lines,
+not per-block token estimates.
+
+## Call traces and compatibility
+
+Each attempt saves its request before dispatch, then its provider response and a
+separate application outcome. Invalid function arguments do not erase the provider
+output. Token-count calls and local counting are distinguished from generations,
+and generations link to the count used for their reservation. Trace metadata uses
+existing accounting; it is not another billing system. Transport timeout is recorded
+separately. Request bodies include actual instructions, ordered inputs, schemas,
+model/effort, output limit, cache/include/store settings and disabled truncation.
+Credentials, headers and environment values are excluded. Research content is
+preserved in these local debug artifacts, so handle them like the source material.
+
+An interrupted attempt without a durable response remains unknown; retry attempts
+have separate records and retain conservative reservations. Receipt reuse does not
+create another call. The dashboard replaces opaque encrypted protocol fields with
+labeled hashes; copied inspection JSON is therefore **not byte-for-byte exact**.
+Original fields remain local for protocol replay. No private reasoning is decoded.
+
+Legacy research defaults to `run_mode=full` and retains its persisted instructions,
+conversation, budgets and original orientation-completion protocol. In-flight legacy
+orientation is not restarted or upgraded to the new 49-question schema. Such runs
+will not acquire a retrospective orientation plan. Historical raw excerpts and
+receipts are unchanged. When the worker next delivers an old saved source, it writes
+a cleaned companion without refetching; old cache keys cannot supply raw excerpts as
+new cleaned deliveries. Dashboard reads never create cleaned files. Historical calls
+without snapshots display “Exact call input was not recorded for this run.” New calls
+made while resuming an old run are traced, but missing historical prompts remain missing.
+
+## Synthetic dashboard preview
+
+No API keys or network/provider calls are needed to create the preview:
+
+```bash
+uv run python tests/preview_dashboard.py
+AGENT_SYSTEM_DATA_DIR=data/dashboard-preview uv run python -m agent_system.dashboard \
+  --job 11111111-1111-4111-8111-111111111111 --port 8765
+```
+
+Open `http://127.0.0.1:8765`. The development fixture contains full cleaned evidence,
+80 discovery leads, all 49 assessments/plans, token counting, and a failed generation
+followed by a successful retry. It lives under ignored data storage and never enables
+a production fake mode. Generation refuses to overwrite an existing preview; use
+`--output /path/to/a/new/preview` and the printed dashboard command for another copy.
+The synthetic fixed clock can intentionally appear stale. Simulated checks and this
+preview do not establish live account access or real research quality.
+
+Generation requests default to 300 seconds; Firecrawl and remote token counting
+retain 90 seconds. Every attempt (including retries) is capped by the remaining
+active-time allowance. The dashboard updates elapsed time and timeout every two
+seconds while an attempt has no recorded outcome, showing configured and effective
+budget-capped timeouts separately. An overdue unknown attempt is not proof that a
+worker is still running. Finished attempts retain their recorded duration.
+
+Both settings are persisted for new jobs. Existing jobs saved before the timeout
+split retain their original shared timeout on resume; no saved research is rewritten.
+The new default does not reopen a job that already exhausted its retry allowance.
