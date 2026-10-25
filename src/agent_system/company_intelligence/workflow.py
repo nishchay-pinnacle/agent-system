@@ -99,7 +99,12 @@ def initial_research(
     settings: ResearchSettings,
     *,
     run_mode: Literal["full", "orientation_only"] = "full",
+    schema_version: int = 2,
 ) -> Research:
+    if schema_version == 3:
+        from agent_system.company_intelligence.execution import initial_run
+
+        return initial_run(job_id, inputs, settings, run_mode)
     inputs = inputs.model_copy(deep=True)
     inputs.url = public_url(inputs.url)
     inputs.product_url = public_url(inputs.product_url)
@@ -1043,6 +1048,19 @@ def run_research(
     *,
     max_steps: int | None = None,
 ) -> Research:
+    if initial is not None and initial.schema_version == 3:
+        from agent_system.company_intelligence.execution import run
+
+        return run(data_dir, job_id, initial, providers, max_steps=max_steps)
+    if initial is None:
+        with SqliteSaver.from_conn_string(
+            str(data_dir / "checkpoints.sqlite")
+        ) as probe:
+            existing = load_research(probe, data_dir / "jobs" / job_id, job_id)
+        if existing is not None and existing.schema_version == 3:
+            from agent_system.company_intelligence.execution import run
+
+            return run(data_dir, job_id, None, providers, max_steps=max_steps)
     directory = data_dir / "jobs" / job_id
     config: RunnableConfig = {"configurable": {"thread_id": job_id}}
     with (

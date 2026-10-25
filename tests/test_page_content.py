@@ -181,7 +181,7 @@ def saved_source(
         source_id=SID,
         requested_url=URL,
         filename=f"sources/{SID}.md",
-        cleaner_version="2",
+        cleaner_version="3",
         outcome="success",
     )
     (directory / source.filename).write_bytes(markdown.encode())
@@ -250,7 +250,7 @@ def test_selection_reports_conversion_failure_and_legacy(
     reopened.cleaned_filename = "sources/../../secret"
     with pytest.raises(ValueError):
         cleaned_path(legacy_dir, reopened)
-    reopened.cleaned_filename = f"sources/{SID}.cleaned.v2.md"
+    reopened.cleaned_filename = f"sources/{SID}.cleaned.v3.md"
     (legacy_dir / reopened.cleaned_filename).symlink_to(tmp_path / "outside")
     with pytest.raises(ValueError):
         cleaned_path(legacy_dir, reopened)
@@ -304,7 +304,7 @@ def test_all_formats_one_sdk_call_shared_delivery(
         == delivery["content_hash"]
         == digest(load_cleaned(directory, source))
     )
-    assert page["cleaner_version"] == delivery["cleaner_version"] == "2"
+    assert page["cleaner_version"] == delivery["cleaner_version"] == "3"
     assert page["cleaning_summary"] == delivery["cleaning_summary"]
     assert search_inventory(directory, "documentation")["entries"]
     before = {str(p): p.read_bytes() for p in directory.rglob("*") if p.is_file()}
@@ -357,3 +357,68 @@ def test_uncertain_components_code_and_variant_context_survive() -> None:
     assert result.content.count("14-day trial") == 2
     assert "<pre><code>  a  b\n</code></pre>" in result.content
     assert "q=editorial" in result.content and "q=widget" not in result.content
+
+
+def test_nested_launch_footer_and_icon_regression(tmp_path: Path) -> None:
+    raw = (Path(__file__).parent / "fixtures" / "cleaner_controls.html").read_text()
+    raw = raw.replace("LONG_PROMPT", "encoded_payload_" * 4000)
+    result = clean_html(raw, URL, SID)
+    text = clean_markdown(result.content)
+    for keep in (
+        "Private compute",
+        "Available on-premises and as SaaS",
+        "Intel TDX",
+        "AMD SEV-SNP",
+        "NVIDIA Blackwell",
+        "Hopper",
+        "Deploy private clusters",
+        "Product supports private deployments",
+        "q=editorial",
+        "q=normal",
+        "q=code",
+        "Compare plans",
+        "ISO 27001",
+        "Exports require approval",
+        "team@example.com",
+        "Certification",
+        "Private cluster topology",
+        "Gateway connects two nodes",
+        "unresolved visual",
+    ):
+        assert keep in text
+    for removed in (
+        "encoded_payload_",
+        "ASK AI ABOUT EXAMPLE",
+        "](/products)",
+        "Key management",
+        "French",
+        "All Right reserved",
+        "[SVG: ]",
+        "linkedin.com/company/example",
+        "x.com/example",
+    ):
+        assert removed not in text
+    assert text.count("Expand details") == 1
+    assert "encoded_payload_" not in json.dumps(result.__dict__)
+    assert {link["url"] for link in result.discovery} >= {
+        "https://example.com/products",
+        "https://example.com/keys",
+        "https://example.com/privacy",
+    }
+    assert len([a for a in result.assets if a["kind"] == "svg"]) == 2
+    assert result == clean_html(raw, URL, SID)
+
+
+def test_v2_bytes_stay_historical_and_v3_paths_are_distinct(tmp_path: Path) -> None:
+    source = saved_source(tmp_path, "Original fallback", "<p>New capture</p>")
+    source.cleaner_version = "2"
+    source.cleaned_filename = f"sources/{SID}.cleaned.v2.md"
+    historical = "ASK AI ABOUT LEGACY: actual bytes the model saw\r\n"
+    (tmp_path / source.cleaned_filename).write_bytes(historical.encode())
+    reopened = Source.model_validate_json(source.model_dump_json())
+    assert load_cleaned(tmp_path, reopened) == historical
+    assert reopened.cleaner_version == "2"
+    (tmp_path / source.cleaned_filename).unlink()
+    with pytest.raises(ValueError, match="historical v2"):
+        load_cleaned(tmp_path, reopened)
+    assert not (tmp_path / source.cleaned_filename).exists()

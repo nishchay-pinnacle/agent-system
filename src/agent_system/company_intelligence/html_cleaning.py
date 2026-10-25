@@ -61,6 +61,12 @@ def share_destination(url: str) -> bool:
         "gemini.google.com": {"/", "/app"},
         "perplexity.ai": {"/", "/search"},
     }
+    if host == "google.com":
+        return (
+            parsed.path == "/search"
+            and query.get("udm") == ["50"]
+            and bool(query.get("q"))
+        )
     if host in ai_paths:
         return parsed.path in ai_paths[host] and bool(
             {"q", "query", "prompt", "text"} & query.keys()
@@ -72,6 +78,64 @@ def share_destination(url: str) -> bool:
         "facebook.com": "/sharer",
     }
     return host in routes and parsed.path.startswith(routes[host]) and bool(query)
+
+
+def launch_label(text: str) -> bool:
+    """A control heading, not an arbitrary occurrence of 'ask' in page prose."""
+    return bool(
+        re.fullmatch(
+            r"(?:ask (?:ai|claude|chatgpt|gemini|perplexity|google)(?: about .+)?|share(?: this)?(?: (?:page|article|on .+))?)[:!?]?",
+            " ".join(text.split()).casefold(),
+        )
+    )
+
+
+def descriptive_link(tag: Tag) -> bool:
+    # Icons and heading-only labels are controls; paragraphs/definitions are evidence.
+    return bool(
+        tag.find(["p", "pre", "code", "table", "blockquote", "dl"])
+        or tag.find(class_=re.compile(r"description|summary"))
+    )
+
+
+def directory_label(link: Tag) -> bool:
+    """Footer link directories sometimes wrap each label in a single paragraph.
+
+    Accept that repeated control shape, but retain prose sentences, multiple blocks,
+    explicit descriptions and any surrounding qualifications.
+    """
+    if not descriptive_link(link):
+        return True
+    paragraphs = link.find_all("p")
+    return (
+        len(paragraphs) == 1
+        and visible_text(link) == visible_text(paragraphs[0])
+        and not re.search(r"[.!?;\n]", visible_text(link))
+        and not link.find(["pre", "code", "table", "blockquote", "dl"])
+        and not link.find(class_=re.compile(r"description|summary"))
+    )
+
+
+def control_only(tag: Tag) -> bool:
+    """No explanatory text outside links, headings or accessible control labels."""
+    if tag.find(["pre", "code", "table", "blockquote", "address", "details"]):
+        return False
+    for paragraph in tag.find_all("p"):
+        link = paragraph.find_parent("a")
+        if link is None or not directory_label(link):
+            return False
+    for text in tag.find_all(string=True):
+        if not str(text).strip():
+            continue
+        if not any(
+            isinstance(parent, Tag)
+            and parent.name
+            in {"a", "button", "h1", "h2", "h3", "h4", "h5", "h6", "svg"}
+            for parent in text.parents
+            if parent is not tag and tag in parent.parents
+        ):
+            return False
+    return True
 
 
 def render_markdown(fragment: str) -> str:
@@ -309,56 +373,68 @@ def clean_html(raw: str, page_url: str, source_id: str) -> HTMLResult:
         elif bounded:
             warn("Ambiguous consent component retained")
 
-    # Sharing requires an explicit widget label and a recognized intent destination.
-    for tag in list(soup.find_all(["div", "aside", "section", "nav", "ul"])):
-        if tag.parent is None or tag.find_parent(["pre", "code", "table"]):
+    # Launch controls need a recognized intent URL plus a bounded label/control group.
+    # Work outward from each link, stopping at prose/landmarks; never remove a section.
+    shells: list[Tag] = []
+    for link in list(soup.find_all(["a", "button"])):
+        destination = attr(link, "href") or attr(link, "formaction")
+        if not share_destination(destination) or link.find_parent(
+            ["pre", "code", "p", "blockquote", "table"]
+        ):
             continue
-        label = " ".join(
-            [attr(tag, "aria-label"), attr(tag, "id"), attr(tag, "class")]
-        ).lower()
-        direct = (
-            " ".join(
-                [
-                    *(str(x) for x in tag.find_all(string=True, recursive=False)),
-                    *(
-                        visible_text(c)
-                        for c in tag.find_all(
-                            ["span", "h2", "h3", "h4"], recursive=False
-                        )
-                        if not c.find("a")
-                    ),
-                ]
+        if descriptive_link(link):
+            continue
+        launch_labelled = any(
+            launch_label(label)
+            for label in (
+                attr(link, "aria-label"),
+                attr(link, "title"),
+                visible_text(link),
             )
-            .strip()
-            .lower()
         )
-        labelled_widget = any(
-            x in label
-            for x in ("share-widget", "social-share", "share this", "ask-ai", "ask ai")
-        ) or direct in {"share", "share this", "ask ai", "ask ai about this page"}
-        if not labelled_widget:
-            continue
-        removed = False
-        for link in list(tag.find_all("a", href=True)):
-            if any(
-                isinstance(parent, Tag) and parent.name in {"p", "blockquote"}
-                for parent in link.parents
-                if parent is not tag and tag in parent.parents
-            ):
-                continue  # Editorial prose inside a mixed component is not a launch control.
-            if share_destination(attr(link, "href")):
-                remove(link, "share_intent")
-                removed = True
-        if removed:
-            # Only empty/label-only shells, never adjacent paragraphs or product detail.
-            if visible_text(tag).lower() in {
-                "",
-                "share",
-                "share this",
-                "ask ai",
-                "ask ai about this page",
+        shell: Tag | None = None
+        for parent in link.parents:
+            if not isinstance(parent, Tag) or parent.name in {
+                "body",
+                "html",
+                "main",
+                "article",
+                "p",
+                "blockquote",
             }:
-                remove(tag, "share_widget_shell")
+                break
+            if parent.name not in {"div", "aside", "section", "nav", "ul", "li"}:
+                continue
+            heading_labels = [attr(parent, "aria-label"), attr(parent, "title")]
+            heading_labels.extend(
+                visible_text(t)
+                for t in parent.find_all(["span", "h1", "h2", "h3", "h4", "h5", "h6"])
+                if not t.find("a") and not t.find_parent(["p", "blockquote"])
+            )
+            heading_labels.extend(
+                str(t) for t in parent.find_all(string=True, recursive=False)
+            )
+            if any(launch_label(label) for label in heading_labels):
+                shell = parent
+                launch_labelled = True
+                break
+            if parent.name in {"section", "nav", "aside"}:
+                break
+        if launch_labelled:
+            remove(link, "share_intent")
+            if shell is not None and all(shell is not item for item in shells):
+                shells.append(shell)
+    for shell in shells:
+        if shell.parent is None:
+            continue
+        # Only label text and empty wrappers may disappear with the controls.
+        remaining = [
+            str(t).strip() for t in shell.find_all(string=True) if str(t).strip()
+        ]
+        if all(launch_label(text) for text in remaining) and not shell.find(
+            ["a", "button", "img", "svg", "pre", "table"]
+        ):
+            remove(shell, "share_widget_shell")
 
     # Breadcrumb trail requires an explicit landmark/label; preserve hierarchy in metadata.
     for tag in list(soup.find_all(True)):
@@ -390,29 +466,87 @@ def clean_html(raw: str, page_url: str, source_id: str) -> HTMLResult:
             if link.parent is None:
                 continue
             discovery(link)
-            if link.find(
-                [
-                    "p",
-                    "section",
-                    "h1",
-                    "h2",
-                    "h3",
-                    "pre",
-                    "code",
-                    "table",
-                    "blockquote",
-                    "img",
-                    "svg",
-                ]
-            ) or link.find(class_=re.compile(r"description|summary")):
+            if not directory_label(link):
                 warn("Descriptive navigation content retained")
                 continue
             remove(link, "global_navigation_controls")
 
+    # Footer directories require a real footer/contentinfo landmark. A containing
+    # section can be its wrapper, but never main/article or the whole page.
+    footer_regions: list[Tag] = []
+    for footer in [
+        *soup.find_all("footer"),
+        *soup.find_all(True, attrs={"role": "contentinfo"}),
+    ]:
+        if footer.find_parent("article"):
+            continue
+        region = footer
+        footer_parent = footer.parent
+        if (
+            isinstance(footer_parent, Tag)
+            and footer_parent.name == "section"
+            and not footer_parent.find(["main", "article", "h1"])
+        ):
+            region = footer_parent
+        if all(region is not item for item in footer_regions):
+            footer_regions.append(region)
+    for region in footer_regions:
+        for group in reversed(list(region.find_all(["div", "section", "ul", "nav"]))):
+            if group.parent is None:
+                continue
+            links: list[Tag] = list(group.find_all("a", href=True))
+            direct_links = group.find_all("a", href=True, recursive=False)
+            if not control_only(group) and len(direct_links) >= 2:
+                # Mixed footer: remove only the sibling controls, keeping prose/labels.
+                links = [link for link in direct_links if directory_label(link)]
+            if (
+                len(links) < 2
+                or (not control_only(group) and len(direct_links) < 2)
+                or any(not directory_label(a) for a in links)
+            ):
+                continue
+            # A list, repeated sibling links, or heading with grouped links is a directory.
+            if (
+                group.name not in {"ul", "nav"}
+                and len(group.find_all("a", recursive=False)) < 2
+                and not group.find(re.compile(r"^h[1-6]$"))
+                and not all(a.find(["img", "svg"]) for a in links)
+            ):
+                continue
+            for link in links:
+                if attr(link, "href").startswith(("mailto:", "tel:")):
+                    continue
+                discovery(link)
+                remove(link, "footer_directory_control")
+            if not group.find("a") and not visible_text(group).strip():
+                remove(group, "footer_directory_shell")
+        for tag in list(
+            region.find_all(["p", "small", "h1", "h2", "h3", "h4", "h5", "h6"])
+        ):
+            if tag.parent is None or tag.find(["a", "img", "svg"]):
+                continue
+            if re.fullmatch(
+                r"(?:[\w &.,'’®™-]+?\s+)?(?:©|Copyright\s*©?)\s*\d{4}(?:[-–]\d{4})?(?:[\w &,'’®™-]+)?\.?\s*(?:All rights? reserved\.?)?",
+                visible_text(tag),
+                re.I,
+            ):
+                remove(tag, "isolated_copyright")
+
     # Header/footer isolated utilities and copyright only, not entire semantic containers.
-    for region in soup.find_all(["header", "footer"]):
+    for region in [*soup.find_all("header"), *footer_regions]:
         if region.find_parent("article"):
             continue
+        for selector in list(region.find_all("select")):
+            label = (
+                " ".join([attr(selector, "aria-label"), attr(selector, "title")])
+                .strip()
+                .casefold()
+            )
+            if (
+                label in {"language", "select language", "choose language", "locale"}
+                and len(selector.find_all("option")) >= 2
+            ):
+                remove(selector, "language_selector")
         for tag in list(region.find_all(["a", "button", "p", "small"])):
             if tag.parent is None:
                 continue
@@ -427,10 +561,14 @@ def clean_html(raw: str, page_url: str, source_id: str) -> HTMLResult:
             }:
                 discovery(tag)
                 remove(tag, "header_footer_utility")
-            elif tag.name in {"p", "small"} and re.fullmatch(
-                r"(?:©|Copyright\s*©?)\s*\d{4}(?:[-–]\d{4})?[^.\n]*(?:\.\s*All rights reserved\.?)?",
-                label_text,
-                re.I,
+            elif (
+                region.name == "footer"
+                and tag.name in {"p", "small"}
+                and re.fullmatch(
+                    r"(?:©|Copyright\s*©?)\s*\d{4}(?:[-–]\d{4})?[^.\n]*(?:\.\s*All rights reserved\.?)?",
+                    label_text,
+                    re.I,
+                )
             ):
                 remove(tag, "isolated_copyright")
 
@@ -525,6 +663,37 @@ def clean_html(raw: str, page_url: str, source_id: str) -> HTMLResult:
             )
         )
 
+    for icon in list(soup.find_all(["svg", "img"])):
+        icon_control = icon.find_parent(["a", "button"])
+        if (
+            icon_control is None
+            or icon.find_parent(["pre", "code"])
+            or not (
+                attr(icon_control, "aria-label")
+                or attr(icon_control, "title")
+                or icon_control.name == "button"
+            )
+        ):
+            continue
+        label = (
+            attr(icon_control, "aria-label")
+            or attr(icon_control, "title")
+            or visible_text(icon_control)
+        )
+        meanings = [
+            attr(icon, "aria-label"),
+            attr(icon, "alt"),
+            *[visible_text(t) for t in icon.find_all(["title", "desc", "text"])],
+        ]
+        if label and all(
+            not meaning or meaning.casefold() == label.casefold()
+            for meaning in meanings
+        ):
+            asset(icon, "control_icon")
+            remove(icon, "redundant_control_icon")
+            if label not in visible_text(icon_control):
+                icon_control.insert(0, NavigableString(label))
+
     for tag in list(soup.find_all("svg")):
         if tag.find_parent(["pre", "code"]):
             continue
@@ -546,7 +715,9 @@ def clean_html(raw: str, page_url: str, source_id: str) -> HTMLResult:
         )
         tag.replace_with(
             NavigableString(
-                "[SVG: " + "; ".join(x for x in labels if x) + f"]({reference})"
+                "[SVG: "
+                + ("; ".join(x for x in labels if x) or "unresolved visual")
+                + f"]({reference})"
             )
         )
     for media in soup.find_all(["video", "audio", "iframe"]):

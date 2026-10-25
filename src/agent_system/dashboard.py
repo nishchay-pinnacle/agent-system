@@ -1,7 +1,8 @@
-"""Read-only, loopback-only dashboard for one saved research job."""
+"""Loopback dashboard with narrow, worker-applied research commands."""
 
 import argparse
 import json
+import secrets
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
@@ -12,6 +13,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import JsonValue
 
+from agent_system.company_intelligence.approvals import UserCommand, enqueue, inbox
 from agent_system.company_intelligence.artifacts import (
     read_events,
     read_json,
@@ -22,9 +24,11 @@ from agent_system.company_intelligence.call_traces import (
     call_summaries,
     safe_path,
 )
+from agent_system.company_intelligence.coordination import Document
+from agent_system.company_intelligence.execution import quality_preview
 from agent_system.company_intelligence.page_content import cleaned_path
 from agent_system.company_intelligence.research_questions import QUESTIONS
-from agent_system.company_intelligence.schemas import Source
+from agent_system.company_intelligence.schemas import Research, Source
 from agent_system.company_intelligence.site_index import search_inventory
 from agent_system.config import data_directory
 from agent_system.worker import job_id_argument
@@ -46,7 +50,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         server: BaseServer,
         *,
         directory: Path,
+        csrf_token: str = "",
     ) -> None:
+        self.csrf_token = csrf_token
         self.directory = directory
         super().__init__(request, client_address, server)
 
@@ -62,7 +68,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "text/html; charset=utf-8",
                 )
                 return
-            if route in {"/dashboard.css", "/dashboard.js", "/dashboard-timing.js"}:
+            if route in {
+                "/dashboard.css",
+                "/dashboard.js",
+                "/dashboard-timing.js",
+                "/dashboard-system.js",
+            }:
                 self.send_body(
                     200,
                     files("agent_system").joinpath(route[1:]).read_bytes(),
@@ -71,7 +82,55 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     else "text/javascript; charset=utf-8",
                 )
                 return
-            if route == "/api/calls":
+            if route == "/api/system":
+                dashboard = read_json(safe_path(self.directory, "dashboard.json"))
+                system = dashboard.get("system")
+                worker_path = self.directory / "worker.json"
+                commands: list[JsonValue] = []
+                if (self.directory / "commands.sqlite").exists():
+                    with inbox(self.directory) as connection:
+                        commands = [
+                            {
+                                "command": UserCommand.model_validate_json(
+                                    payload
+                                ).model_dump(mode="json"),
+                                "outcome": outcome,
+                            }
+                            for payload, outcome in connection.execute(
+                                "SELECT payload,outcome FROM commands ORDER BY rowid"
+                            )
+                        ]
+                self.send_json(
+                    200,
+                    {
+                        "system": system,
+                        "job_id": dashboard["job_id"],
+                        "status": dashboard["status"],
+                        "settings": dashboard["settings"],
+                        "worker": read_json(worker_path)
+                        if worker_path.exists()
+                        else {},
+                        "csrf_token": self.csrf_token,
+                        "commands": commands,
+                    },
+                )
+            elif route == "/api/quality-preview":
+                dashboard = read_json(safe_path(self.directory, "dashboard.json"))
+                state = Research.model_validate(
+                    {
+                        "instructions": "",
+                        **{
+                            k: v
+                            for k, v in dashboard.items()
+                            if k not in {"system", "assessments"}
+                        },
+                    }
+                )
+                doc = Document.model_validate(dashboard.get("system"))
+                self.send_json(
+                    200, quality_preview(doc, state, query.get("batch", [None])[0])
+                )
+            elif route == "/api/calls":
                 self.send_json(
                     200,
                     call_summaries(
@@ -208,6 +267,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (ValueError, OSError) as exc:
             self.send_json(400, {"error": str(exc)[:200]})
 
+    def do_POST(self) -> None:
+        try:
+            host = self.headers.get("Host", "")
+            expected = f"127.0.0.1:{self.connection.getsockname()[1]}"
+            if host != expected or self.headers.get("Origin") != f"http://{expected}":
+                self.send_json(403, {"error": "Same-origin loopback commands only"})
+                return
+            if not self.csrf_token or not secrets.compare_digest(
+                self.headers.get("X-CSRF-Token", ""), self.csrf_token
+            ):
+                self.send_json(403, {"error": "Invalid CSRF token"})
+                return
+            if self.headers.get("Content-Type") != "application/json":
+                raise ValueError("JSON content type required")
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 16384:
+                raise ValueError("Invalid command size")
+            command = UserCommand.model_validate_json(self.rfile.read(length))
+            dashboard = read_json(safe_path(self.directory, "dashboard.json"))
+            if (
+                command.job_id != dashboard["job_id"]
+                or self.path != f"/api/jobs/{command.job_id}/commands"
+            ):
+                raise ValueError("Wrong job command route")
+            if dashboard.get("schema_version") != 3:
+                raise ValueError("Historical jobs do not accept version-three commands")
+            outcome = enqueue(
+                self.directory, command, Document.model_validate(dashboard["system"])
+            )
+            self.send_json(202, {"command_id": command.command_id, "outcome": outcome})
+        except (ValueError, OSError) as exc:
+            self.send_json(409, {"error": str(exc)[:300]})
+
     def send_json(self, status: int, value: dict[str, JsonValue]) -> None:
         self.send_body(
             status, json.dumps(value).encode(), "application/json; charset=utf-8"
@@ -232,7 +324,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def make_server(directory: Path, port: int) -> ThreadingHTTPServer:
     return ThreadingHTTPServer(
-        ("127.0.0.1", port), partial(DashboardHandler, directory=directory)
+        ("127.0.0.1", port),
+        partial(
+            DashboardHandler, directory=directory, csrf_token=secrets.token_urlsafe(32)
+        ),
     )
 
 
@@ -245,7 +340,7 @@ def main() -> int:
         directory = job_directory(data_directory(), args.job)
         with make_server(directory, args.port) as server:
             print(
-                f"Read-only dashboard: http://127.0.0.1:{server.server_port}",
+                f"Local dashboard: http://127.0.0.1:{server.server_port}",
                 flush=True,
             )
             server.serve_forever()

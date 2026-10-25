@@ -63,7 +63,7 @@ def display_research(state: "Research") -> int:
     print(f"Status: {state.status}; phase: {state.phase}")
     print(f"Stop reason: {state.stop_reason or 'not stopped'}")
     if state.limiting_resource:
-        print(f"Limit: {state.limiting_resource}; resume cannot reopen a terminal run")
+        print(f"Limit: {state.limiting_resource}")
     if state.error:
         print(f"Error: {state.error}")
     print(f"Run mode: {state.run_mode}")
@@ -108,6 +108,14 @@ def main(argv: list[str] | None = None) -> int:
             )
             settings = research_settings()
             validate_credentials()
+            print(
+                "Research roles: "
+                + ", ".join(
+                    f"{role}={getattr(settings, role + '_model')}/{getattr(settings, role + '_effort')}"
+                    for role in ("orientation", "coordinator", "investigator")
+                ),
+                flush=True,
+            )
             initial = initial_research(
                 job_id,
                 Inputs(
@@ -119,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 settings,
                 run_mode="orientation_only" if args.orientation_only else "full",
+                schema_version=3,
             )
             data_dir.mkdir(parents=True, exist_ok=True)
             result = run_research(data_dir, job_id, initial)

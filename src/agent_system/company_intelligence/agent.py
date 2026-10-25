@@ -29,9 +29,12 @@ JSON_ITEMS = TypeAdapter(list[dict[str, JsonValue]])
 
 
 class ProviderFailure(Exception):
-    def __init__(self, message: str, *, transient: bool = False) -> None:
+    def __init__(
+        self, message: str, *, transient: bool = False, capacity: bool = False
+    ) -> None:
         super().__init__(message)
         self.transient = transient
+        self.capacity = capacity
 
 
 class Generation(BaseModel):
@@ -313,6 +316,17 @@ class LiveProviders:
 
 def openai_failure(exc: APIConnectionError | APIStatusError) -> ProviderFailure:
     code = exc.status_code if isinstance(exc, APIStatusError) else None
+    body = exc.body if isinstance(exc, APIStatusError) else None
+    error = body.get("error", body) if isinstance(body, dict) else None
+    capacity = isinstance(error, dict) and error.get("code") in {
+        "context_length_exceeded",
+        "max_tokens_exceeded",
+    }
+    if capacity:
+        return ProviderFailure(
+            "Complete input exceeds provider capacity; increasing the application allowance cannot fix this. Select an explicitly smaller review scope or a compatible configured model; content was not truncated.",
+            capacity=True,
+        )
     return ProviderFailure(
         f"OpenAI {type(exc).__name__} (status {code}); verify the configured model, credentials and API access",
         transient=code is None or code in {408, 409, 429} or code >= 500,

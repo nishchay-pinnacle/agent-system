@@ -1,10 +1,10 @@
 # Pinnacle / agent-system
 
-A local, synchronous application for researching **one campaign product** from
-public web pages. LangGraph and SQLite save progress between model/tool steps;
-JSON, original and cleaned Markdown, discovery inventory, and exact call snapshots
-stay on disk. A read-only workbench displays calls, sources, question coverage,
-focused investigation plans, findings, gaps, usage and results.
+A local Python application for researching **one campaign product**. New version-three
+runs use full-page orientation, a coordinator, and up to three concurrent investigators.
+One worker owns canonical state; LangGraph/SQLite checkpoints reference durable local
+revision files, complete cleaned evidence, findings, and exact Responses call traces.
+The System dashboard displays execution and accepts narrow worker-applied commands.
 
 ## Setup
 
@@ -16,12 +16,21 @@ uv manages Python 3.13 and the project `.venv`. Optionally copy `.env.example` t
 `.env` and add `OPENAI_API_KEY` and `FIRECRAWL_API_KEY`. Existing environment
 variables take precedence. Never put real keys in tracked files.
 
-Research defaults to `OPENAI_MODEL=gpt-6.1-sol` and
-`OPENAI_REASONING_EFFORT=medium`. The same model handles every phase. The application
-never substitutes a model; unavailable models/configuration fail visibly. API access
-and credentials must be supplied by you; implementation tests do not establish live
-account access. Model, effort, instructions and limits are persisted with each job;
-changing environment settings affects new jobs, not resumed ones.
+New research roles default to `gpt-6-luna` with `medium` reasoning. The explicitly
+requested quality review defaults to `gpt-6.1-sol` / `medium`. Model IDs are never
+silently substituted. API/model access is not established by the fake-provider tests.
+
+`OPENAI_MODEL` and `OPENAI_REASONING_EFFORT` explicitly override the three research
+roles. Per-role `AGENT_SYSTEM_ORIENTATION_MODEL`, `AGENT_SYSTEM_COORDINATOR_MODEL`,
+`AGENT_SYSTEM_INVESTIGATOR_MODEL` (and corresponding `_EFFORT` settings) take precedence.
+Quality uses `AGENT_SYSTEM_QUALITY_MODEL` / `AGENT_SYSTEM_QUALITY_EFFORT` separately.
+The worker prints resolved research models before execution. Settings are saved once;
+changing environment values never changes a resumed job.
+
+If an existing `.env` contains `OPENAI_MODEL=gpt-6.1-sol`, change it to
+`OPENAI_MODEL=gpt-6-luna` for normal testing, keeping `OPENAI_REASONING_EFFORT=medium`.
+Alternatively prefix the research command with those two environment assignments.
+The implementation does not rewrite your `.env`.
 
 ## Research and dashboard: two terminals
 
@@ -45,67 +54,97 @@ Terminal 2:
 uv run python -m agent_system.dashboard --job <job_id> --port 8765
 ```
 
-Open `http://127.0.0.1:8765`. The standard-library server binds only to loopback,
-polls saved files every 2 seconds, exposes explicit job-scoped GET routes, and
-never calls providers or changes research. It remains useful after the worker exits.
-Calls is the default view: select an attempt, then inspect Overview, Input, Output
-and JSON. Full prompts load on demand; count operations are an optional filter.
-Profile & Plan shows the eight sections, 49 questions and focused backlog. Sources
-separates fetched evidence (Raw/Cleaned line coordinates) from paginated inventory
-search. Activity retains saved events. Copy controls expose profile/result and
-request/response inspection JSON. All page/provider text is escaped. A stale saved `running` status is labeled “no recent activity,” not
-proof of a live worker. Reading saved runs requires no internet access.
+Open `http://127.0.0.1:8765`. System is the initial view for active new runs. It shows
+orientation, a logical coordinator, batches of investigators, separate answer/work
+coverage, used/reserved allowances, and human decisions. Select an agent or question
+for findings, missing information, sources, attempts, and exact-call links. Completed
+batches collapse; selection and filters persist during polling. Calls, Sources,
+Profile & Plan, and Activity remain available. All research content is escaped.
 
 ```bash
 uv run python -m agent_system.worker status --job <job_id>
 uv run python -m agent_system.worker resume --job <job_id>
 ```
 
-Ctrl+C preserves completed work and reports `interrupted`. Resume retains identity,
-settings, attempts, history and budgets, reuses saved fetches/operation receipts,
-and continues recoverable progress. A per-job OS process lock prevents concurrent
-research writers; dashboard readers hold no worker lock. An operation gets at most
-one explicit transient retry; authentication/configuration errors never retry
-automatically. Manual resume can retry a failed/uncertain attempt once, within the
-same limits. Exhausted attempts remain blocked. Unknown IDs fail clearly.
+The worker remains available while awaiting approval. When it is offline, dashboard
+decisions are saved and labelled **Approved — waiting for worker** until resume applies
+them. The dashboard never starts a worker or calls a provider. Writes require the
+same loopback origin and CSRF token and enter a job-local command inbox; only the
+locked worker applies them. Repeated submissions cannot apply an amendment twice.
 
-## Research behavior and stop meanings
+## New research execution and limits
 
-Orientation scrapes company/product URLs (deduplicated), cleans their full content,
-and maps the site before one normally sufficient model submission. It has no
-exploration tools. The full cleaned pages, fixed question catalog, small discovery
-summary and limits form the input; the inventory stays on disk. If this complete
-request exceeds the input cap, the run stops with `limiting_resource=input_tokens`
-before generation; content is never silently shortened. Missing or empty required
-pages block orientation visibly. Targeted investigations name a question, consequence,
-source strategy and resolution criterion. The eight profile sections cover scope,
-capabilities, problems/use cases, customer fit, people/roles, buying decisions,
-distinctive expertise and customer language. Claims cite successfully saved sources;
-coverage and prose preserve uncertainty, explicit statements versus inference,
-product boundaries, restrictions and contradictions. Search snippets are leads.
+Orientation supplies complete cleaned overview pages, campaign boundaries, all 49
+stable questions, and compact discovery metadata. Its original snapshot is preserved.
+`--orientation-only` stops there. Otherwise the coordinator groups related questions
+into assignments, validates prerequisites, runs an explicit batch, and incorporates
+settled results before creating another batch. Investigators save incremental findings
+through normal tool submissions, with no summarizer calls. They cannot edit canonical
+profile/questions. Newly discovered questions receive stable IDs; merged questions keep
+old IDs and history. Completing an investigation never automatically answers a question.
 
-Three unsuccessful attempts park a gap. Reopening requires a new named source and
-reason while retaining history. Three consecutive investigations without progress
-trigger final review. Final review can return to one named investigation followed
-by a closing review. Fresh investigation contexts preserve findings and history
-without carrying the entire prior transcript. Within an investigation, full
-Responses protocol items (including encrypted reasoning items) are replayed locally;
-private reasoning is never shown on the dashboard.
+Contexts start fresh from relevant saved state for each investigator/coordinator cycle.
+Complete cleaned pages are retrieved on demand; active Responses protocol items remain
+intact. No automatic chunking, excerpting, compression, or truncation is used for v3.
+Shared successful sources are reused; simultaneous fetches share one provider request.
+Failed/uncertain attempts remain recorded. Checkpoints and receipts prevent replaying
+known completed work, but do not guarantee exactly-once remote execution.
 
-- `orientation_complete`: orientation-only run completed; profile remains provisional.
-- `sufficient_understanding`: final review considers understanding sufficient.
-- `public_sources_exhausted`: final review identifies limits of accessible evidence.
-- `budget_reached`: terminal partial result; `limiting_resource` names the cap.
-- `blocked_by_error` / `interrupted`: execution failed/stopped; not successful research.
+| New-run resource | Default |
+| --- | ---: |
+| Concurrent investigators / launched investigations | 3 / 12 |
+| Generation attempts, all roles | 120 |
+| Input + output tokens / input per call | 2,000,000 / 96,000 |
+| Firecrawl attempts / successful captures | 80 / 60 |
+| Active execution seconds | 3,600 |
+| Per-investigator generations / new pages / tool actions | 12 / 6 / 40 |
+| Run-wide tool actions | 500 |
+| Orientation / coordinator / investigator / quality output ceilings | 12,000 / 16,000 / 8,000 / 12,000 |
 
-Readiness is independently `ready` or `needs_review`. A critical unresolved product
-boundary always requires review. Completed jobs, including budget stops, cannot be
-reopened by resume. Missing coverage is retained rather than filled with inventions.
+Existing retrieval/generation timeouts remain 90/300 seconds. Appropriate transient
+failures get at most one retry, charged to the same assignment. Token counts have a
+separate `2 × generation limit + 2` bound. Usage includes conservative reservations and
+unknown charges; it is not an exact invoice or dollar cap. Active time measures elapsed
+execution once across concurrent calls, excluding approval waiting and stopped workers.
+
+A limit pauses a justified blocked action, rather than completing the run. Requests
+state the action, missing information, expected value, and used/reserved allowances.
+A 25% increase is only a suggestion (or the immediate shortfall if larger). Approve it,
+enter another positive increase, decline, or finish with current findings. Limits change;
+usage/history never reset. Local declines retain incremental findings and prevent
+immediate equivalent reassignment. Global declines leave affected work paused.
+Provider-capacity errors cannot be fixed by approving more application budget.
+
+Finalization has one bounded coverage check and no recurring return-investigation loop.
+Every unresolved original/added question enters the interview backlog, including partial
+answers, with explicit missing information and a reason. User-finalized results require
+no closing model call and retain unincorporated findings separately.
+
+## Optional Sol quality review
+
+After finalization, select a completed batch in System and choose **Preview Sol quality
+check**. The default is the earliest completed batch with the highest-priority work.
+The preview shows the batch, questions, complete sources, model, and allowances. Only
+**Run Sol quality check** queues execution. Resume the worker if it has exited.
+
+The review freezes the profile/question index and selected batch, uses complete saved
+supporting sources, and makes one generation with at most one transient retry. It uses
+normal accounting/approvals without scraping, discovery, or changing finalized research.
+Its separate report identifies evidence-linked corrections and explicitly limits its
+claims to the supplied scope. Applying corrections or rerunning research is outside v1.
+
+## Historical compatibility
+
+Versions 1 and 2 retain their original sequential workflow, settings, excerpt delivery,
+review/return policy, and terminal budget stops. Resume does not upgrade or reopen them.
+Historical traces and results are unchanged. New CLI research uses version 3; the internal
+legacy initializer remains available for compatibility tests. Missing System fields are
+handled without inventing historical execution.
 
 ## Cleaning and result interpretation
 
 Each scrape requests Markdown, HTML and raw HTML in one call without main-content
-filtering. Cleaner v2 prefers usable HTML, then raw HTML, then conservative Markdown.
+filtering. Cleaner v3 prefers usable HTML, then raw HTML, then conservative Markdown.
 Structural rules remove confirmed interface controls while preserving substantive
 prose, code, tables, hidden answers/variants, qualifiers and accessible labels. Complex
 tables retain semantic HTML, displayed as escaped text in the dashboard. Removed
@@ -119,9 +158,10 @@ Ambiguous DOM components survive; legacy Markdown lacks structural signals. Cont
 loaded only after JavaScript interaction, diagrams and media may require further
 inspection. Empty/loading/error captures block successful source delivery. Existing
 cleaned filenames and bytes are honored; missing v1 copies use the original v1
-algorithm. No automatic recleaning, historical output migration or research rerun occurs.
+algorithm. Existing v2 copies are preserved; a missing v2 copy must be restored
+from backup rather than regenerated under new rules. No automatic recleaning, historical output migration or research rerun occurs.
 
-`result.json` projects every partial/unassessed assessment into `consequential_gaps`,
+For legacy runs, `result.json` projects every partial/unassessed assessment into `consequential_gaps`,
 alongside unresolved explicit gaps. Completed plans do not resolve assessments.
 `interview_questions` contains only explicit company-input questions on unresolved
 items, deduplicated without fabricating questions. It can be empty while public-research
@@ -129,7 +169,10 @@ gaps remain. Readiness and stop meanings are unchanged. Research seeks substanti
 product understanding: customer stories can supply relevant facts, but testimonials,
 logos, named customers and quote collections are not investigation objectives.
 
-## Limits and accounting
+## Legacy limits and accounting
+
+The following table and excerpt/runtime rules describe versions 1–2 only. New-run
+limits and approval behavior are documented above; saved historical limits win.
 
 | Limit | Default | Environment override |
 | --- | ---: | --- |
@@ -186,8 +229,8 @@ connections are created during imports. This is the editable local `uv sync` set
 - `checkpoints.sqlite`: authoritative LangGraph workflow state.
 - `jobs/<job_id>/sources/<source_id>.md`: original fetched Markdown.
 - `sources/<source_id>.html` and `.raw.html`: unmodified HTML captures, when returned.
-- `sources/<source_id>.cleaned.v2.md`: canonical cleaned evidence; legacy `.cleaned.md` stays readable.
-- `sources/<source_id>.cleaning.v2.json`: representation choice, hashes/counts, structural
+- `sources/<source_id>.cleaned.v3.md`: canonical cleaned evidence; legacy `.cleaned.md` stays readable.
+- `sources/<source_id>.cleaning.v3.json`: representation choice, hashes/counts, structural
   rule removals, warnings, navigation leads, asset locators and labelled JSON-LD metadata.
 - `sources.json`, `profile.json`: source manifest with representation, cleaner version,
   SHA-256 hashes and byte/line statistics; current eight-section profile.
@@ -273,8 +316,8 @@ convert to full runs. Their banner explicitly identifies a provisional profile.
 
 All 49 question IDs must appear exactly once. Partial/unassessed questions require
 at least one focused plan, with one question ID per plan; multiple plans may address
-one question. Application-assigned plan IDs remain stable. Full runs must select
-pending plans when starting investigations. A separate explicit, evidence-validated
+one question. Application-assigned plan IDs remain stable. Legacy full runs select
+pending plans when starting investigations; version-three coordinators regroup these suggestions. A separate explicit, evidence-validated
 assessment update changes question status; finishing an investigation does not.
 Newly revealed gaps can add plans; superseding requires an explanation. The original
 orientation snapshot stays unchanged while checkpointed assessment/backlog statuses
@@ -293,7 +336,7 @@ Cleaning is versioned and conservative: normalize line endings/NULs, remove comp
 script/style blocks and HTML comments outside fenced code, and collapse excessive
 blank lines outside code. It preserves substantive prose, links, image alt text,
 tables, caveats and examples. It does not promise universal cookie/navigation removal.
-Only orientation bypasses the normal excerpt limits. Statistics are bytes/lines,
+In versions 1–2, only orientation bypasses the excerpt limits. Version 3 delivers complete cleaned pages for all research roles. Statistics are bytes/lines,
 not per-block token estimates.
 
 ## Call traces and compatibility
@@ -352,3 +395,34 @@ worker is still running. Finished attempts retain their recorded duration.
 Both settings are persisted for new jobs. Existing jobs saved before the timeout
 split retain their original shared timeout on resume; no saved research is rewritten.
 The new default does not reopen a job that already exhausted its retry allowance.
+
+## Coordinated synthetic dashboard previews
+
+These commands use fake providers only and refuse to overwrite an existing preview:
+
+```bash
+uv run python tests/preview_dashboard.py --scenario paused --output /tmp/pinnacle-paused
+uv run python tests/preview_dashboard.py --scenario completed --output /tmp/pinnacle-completed
+uv run python tests/preview_dashboard.py --scenario active --output /tmp/pinnacle-active
+```
+
+Each prints its dashboard command. Completed includes a separate quality review;
+paused includes multiple batches and a pending decision. Active captures an execution
+boundary with an offline worker, so it must not pretend execution is still live.
+
+Version-three artifacts include immutable `state/revision_*.json` references from
+SQLite, `contexts/`, `operations/`, `question_index.json`, `reviews/`, the local
+`commands.sqlite` inbox, and a `worker.json` liveness projection. Preserve these together
+when backing up a job. The original result stays frozen when a quality review runs.
+
+Future explicitly authorized live orientation trial (not part of verification):
+
+```bash
+OPENAI_MODEL=gpt-6-luna OPENAI_REASONING_EFFORT=medium \
+uv run python -m agent_system.worker research --orientation-only \
+  --company "ExampleCo" --url "https://example.com" \
+  --product "Product name" --product-url "https://example.com/product"
+```
+
+Replace example inputs before use. Omit `--orientation-only` only when authorizing the
+full research budget. A quality check additionally requires its explicit dashboard action.

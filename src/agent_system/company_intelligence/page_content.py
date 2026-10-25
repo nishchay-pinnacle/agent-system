@@ -19,7 +19,7 @@ from agent_system.company_intelligence.html_cleaning import (
 )
 from agent_system.company_intelligence.schemas import Source
 
-CLEANER_VERSION = "2"
+CLEANER_VERSION = "3"
 
 
 def digest(text: str) -> str:
@@ -167,9 +167,15 @@ def artifact_path(
 
 
 def cleaned_path(directory: Path, source: Source) -> Path:
-    suffix = ".cleaned.v2.md" if source.cleaner_version == "2" else ".cleaned.md"
+    suffix = (
+        f".cleaned.v{source.cleaner_version}.md"
+        if source.cleaner_version in {"2", "3"}
+        else ".cleaned.md"
+    )
     filename = source.cleaned_filename or f"sources/{source.source_id}{suffix}"
-    return artifact_path(directory, source, filename, {".cleaned.md", ".cleaned.v2.md"})
+    return artifact_path(
+        directory, source, filename, {".cleaned.md", ".cleaned.v2.md", ".cleaned.v3.md"}
+    )
 
 
 def usable(content: str) -> bool:
@@ -208,12 +214,23 @@ def load_cleaned(directory: Path, source: Source) -> str:
         content = path.read_bytes().decode("utf-8")
         source.cleaned_hash = digest(content)
         if source.cleaner_version is None:
-            source.cleaner_version = "2" if path.name.endswith(".v2.md") else "1"
+            source.cleaner_version = (
+                "3"
+                if path.name.endswith(".v3.md")
+                else "2"
+                if path.name.endswith(".v2.md")
+                else "1"
+            )
         source.cleaned_filename = f"sources/{path.name}"
-        if source.cleaner_version == "2":
-            report_name = f"sources/{source.source_id}.cleaning.v2.json"
+        if source.cleaner_version in {"2", "3"}:
+            report_name = (
+                f"sources/{source.source_id}.cleaning.v{source.cleaner_version}.json"
+            )
             report_path = artifact_path(
-                directory, source, report_name, {".cleaning.v2.json"}
+                directory,
+                source,
+                report_name,
+                {".cleaning.v2.json", ".cleaning.v3.json"},
             )
             if report_path.exists():
                 report = read_json(report_path)
@@ -227,6 +244,10 @@ def load_cleaned(directory: Path, source: Source) -> str:
     if source.cleaner_version in {None, "1"}:
         cleaned = clean_markdown_v1(raw)
         source.cleaner_version = "1"
+    elif source.cleaner_version == "2":
+        raise ValueError(
+            "Missing historical v2 cleaned file; restore it from backup rather than recleaning with v3"
+        )
     elif source.cleaner_version == CLEANER_VERSION:
         cleaned = clean_new(directory, source, raw)
     else:
@@ -327,7 +348,7 @@ def clean_new(directory: Path, source: Source, markdown: str) -> str:
         rule = str(removal["rule"])
         count = rule_counts.get(rule, 0)
         rule_counts[rule] = int(str(count)) + 1
-    report_name = f"sources/{source.source_id}.cleaning.v2.json"
+    report_name = f"sources/{source.source_id}.cleaning.v{CLEANER_VERSION}.json"
     report: dict[str, JsonValue] = {
         "cleaner_version": CLEANER_VERSION,
         "input_representation_version": 1,
@@ -348,7 +369,9 @@ def clean_new(directory: Path, source: Source, markdown: str) -> str:
         "breadcrumbs": list(result.breadcrumbs),
         "link_provenance": [dict(link) for link in result.links],
     }
-    report_path = artifact_path(directory, source, report_name, {".cleaning.v2.json"})
+    report_path = artifact_path(
+        directory, source, report_name, {".cleaning.v2.json", ".cleaning.v3.json"}
+    )
     if not report_path.exists():
         save_json(report_path, report)
     source.cleaning_report_filename = report_name
@@ -365,7 +388,10 @@ def discovery_links(directory: Path, source: Source) -> list[dict[str, str]]:
         return []
     report = read_json(
         artifact_path(
-            directory, source, source.cleaning_report_filename, {".cleaning.v2.json"}
+            directory,
+            source,
+            source.cleaning_report_filename,
+            {".cleaning.v2.json", ".cleaning.v3.json"},
         )
     )
     links = report.get("discovery_links", [])

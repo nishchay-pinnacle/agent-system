@@ -53,6 +53,11 @@ class PreviewProviders(ScriptedProviders):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("data/dashboard-preview"))
+    parser.add_argument(
+        "--scenario",
+        choices=["orientation", "active", "paused", "completed"],
+        default="orientation",
+    )
     args = parser.parse_args()
     root = args.output.resolve()
     if (root / "jobs" / JOB_ID).exists():
@@ -60,6 +65,15 @@ def main() -> None:
             "Preview already exists; choose a new --output directory. No files were replaced."
         )
     root.mkdir(parents=True, exist_ok=True)
+    if args.scenario != "orientation":
+        from coordinated_preview import create_preview
+
+        create_preview(root, JOB_ID, args.scenario)
+        print(f"Synthetic {args.scenario} preview saved: {root}")
+        print(
+            f"AGENT_SYSTEM_DATA_DIR='{root}' uv run python -m agent_system.dashboard --job {JOB_ID} --port 8765"
+        )
+        return
     ticks = count()
     timestamp = "2026-01-01T12:00:00+00:00"
     with (

@@ -47,6 +47,22 @@ class ResearchSettings(StrictModel):
     total_tokens: int = Field(default=500_000, gt=0)
     input_tokens: int = Field(default=48_000, gt=0)
     output_tokens: int = Field(default=6000, gt=0)
+    concurrent_investigators: int = Field(default=3, gt=0, le=16)
+    investigator_generations: int = Field(default=12, gt=0)
+    investigator_pages: int = Field(default=6, gt=0)
+    investigator_actions: int = Field(default=40, gt=0)
+    tool_actions: int = Field(default=500, gt=0)
+    coordinator_output_tokens: int = Field(default=16000, gt=0)
+    investigator_output_tokens: int = Field(default=8000, gt=0)
+    quality_output_tokens: int = Field(default=12000, gt=0)
+    orientation_model: str = "gpt-6-luna"
+    coordinator_model: str = "gpt-6-luna"
+    investigator_model: str = "gpt-6-luna"
+    quality_model: str = "gpt-6.1-sol"
+    orientation_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    coordinator_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    investigator_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    quality_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
     map_limit: int = Field(default=5000, gt=0)
     orientation_output_tokens: int = Field(default=12000, gt=0)
     request_seconds: float = Field(default=90, gt=0)
@@ -262,6 +278,7 @@ class Research(StrictModel):
                 }
         return value
 
+    runtime_path: str | None = None
     job_id: str
     job_type: Literal["research"] = "research"
     schema_version: int = 1
@@ -276,9 +293,9 @@ class Research(StrictModel):
     settings: ResearchSettings
     instructions: str
     phase: Phase = "orientation"
-    status: Literal["running", "completed", "blocked_by_error", "interrupted"] = (
-        "running"
-    )
+    status: Literal[
+        "running", "completed", "blocked_by_error", "interrupted", "paused"
+    ] = "running"
     stop_reason: str | None = None
     limiting_resource: str | None = None
     error: str | None = None
