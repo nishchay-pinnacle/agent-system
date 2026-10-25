@@ -71,10 +71,6 @@ def public_url(value: str, *, resolve: bool = False) -> str:
             not ipaddress.ip_address(a[4][0]).is_global for a in addresses
         ):
             raise ValueError("Source resolves to a non-public address")
-    if parts.path.lower().endswith(".pdf"):
-        raise ValueError(
-            "PDF ingestion is unsupported; record this source as unresolved"
-        )
     return urlunsplit(
         (parts.scheme, parts.netloc.lower(), parts.path or "/", parts.query, "")
     )
@@ -180,3 +176,12 @@ def excerpt(
         "content": content,
         "excerpt_limit": "3500 tokens maximum; conservative UTF-8 byte bound",
     }
+
+
+def legacy_public_url(value: str, *, resolve: bool = False) -> str:
+    result = public_url(value, resolve=resolve)
+    if urlsplit(result).path.lower().endswith(".pdf"):
+        raise ValueError(
+            "PDF ingestion is unsupported; record this source as unresolved"
+        )
+    return result

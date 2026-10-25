@@ -48,6 +48,9 @@ class Generation(BaseModel):
 
 
 class FetchResult(BaseModel):
+    status_code: int | None = None
+    content_type: str | None = None
+    provider_error: str | None = None
     markdown: str | None = None
     html: str | None = None
     raw_html: str | None = None
@@ -263,6 +266,9 @@ class LiveProviders:
                     public_url(final, resolve=True)
                 credits = metadata.credits_used if metadata else None
                 return FetchResult(
+                    status_code=getattr(metadata, "status_code", None),
+                    content_type=getattr(metadata, "content_type", None),
+                    provider_error=getattr(metadata, "error", None),
                     markdown=document.markdown,
                     html=document.html,
                     raw_html=document.raw_html,

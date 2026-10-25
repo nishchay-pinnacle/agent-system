@@ -23,9 +23,27 @@ def create_preview(root: Path, job_id: str, scenario: str) -> None:
                 and payload["latest_batch"]
                 and payload["latest_batch"][0]["assignment_id"] == "assignment_0001"
             ):
-                generated.output[0]["arguments"] = json.dumps(
-                    proposal([spec(["S3"]), spec(["C2"])])
+                revised = json.loads(generated.output[0]["arguments"])
+                if "proposal" in revised:
+                    revised["proposal"] = proposal([spec(["S3"]), spec(["C2"])])
+                else:
+                    revised = proposal([spec(["S3"]), spec(["C2"])])
+                generated.output[0]["arguments"] = json.dumps(revised)
+            if (
+                state.phase == "investigation"
+                and generated.output[0]["name"] == "submit"
+                and payload.get("assignment", {}).get("assignment_id")
+                == "assignment_0001"
+            ):
+                corrected = any(
+                    json.loads(str(item.get("output", "{}"))).get("accepted") is False
+                    for item in state.messages
+                    if item.get("type") == "function_call_output"
                 )
+                if not corrected:
+                    rejected = json.loads(generated.output[0]["arguments"])
+                    rejected["findings"][0]["source_ids"] = ["s_uninspected"]
+                    generated.output[0]["arguments"] = json.dumps(rejected)
             return generated
 
         def count_input(self, state: Research, timeout: float) -> int:

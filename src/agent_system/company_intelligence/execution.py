@@ -8,7 +8,7 @@ from typing import Literal
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 
 from agent_system.company_intelligence.agent import (
     FetchResult,
@@ -38,6 +38,7 @@ from agent_system.company_intelligence.call_traces import (
 )
 from agent_system.company_intelligence.contexts import (
     Action,
+    component_sizes,
     messages,
     request,
     save_messages,
@@ -121,7 +122,12 @@ def new_document(state: Research) -> Document:
         )
     }
     limits["counting_requests"] = limits["generation_requests"] * 2 + 2
-    doc = Document(questions=catalog(), limits=limits, original_limits=limits.copy())
+    doc = Document(
+        storage_version=2,
+        questions=catalog(),
+        limits=limits,
+        original_limits=limits.copy(),
+    )
     doc.orientation_queue = [
         {"tool": "scrape_page", "url": url}
         for url in dict.fromkeys([state.inputs.url, state.inputs.product_url])
@@ -139,7 +145,10 @@ def new_document(state: Research) -> Document:
             source_id=source_id(url), requested_url=url
         )
     doc.sessions["orientation"] = Session(
-        session_id="orientation", role="orientation", transcript_path=""
+        session_id="orientation",
+        role="orientation",
+        transcript_path="",
+        contract_version=2,
     )
     return doc
 
@@ -147,7 +156,17 @@ def new_document(state: Research) -> Document:
 def load_document(directory: Path, state: Research) -> Document:
     if state.runtime_path is None:
         return new_document(state)
-    return Document.model_validate(read_json(safe_path(directory, state.runtime_path)))
+    from agent_system.company_intelligence.findings import adapt_legacy, hydrate
+
+    return adapt_legacy(
+        directory,
+        hydrate(
+            directory,
+            Document.model_validate(
+                read_json(safe_path(directory, state.runtime_path))
+            ),
+        ),
+    )
 
 
 def event(doc: Document, kind: str, session_id: str = "", **details: JsonValue) -> None:
@@ -166,14 +185,18 @@ def projection(directory: Path, state: Research, doc: Document) -> None:
     summary = state.model_dump(
         mode="json", exclude={"messages", "events", "cache", "instructions"}
     )
-    summary["usage"] = {
-        **state.usage.model_dump(mode="json"),
-        "generation_requests": doc.usage.get("generation_requests", 0),
-        "input_tokens": doc.usage.get("input_tokens_used", 0),
-        "output_tokens": doc.usage.get("output_tokens", 0),
-        "active_seconds": doc.usage.get("active_seconds", 0),
-        "reserved_tokens": doc.usage.get("reserved_total_tokens", 0),
+    from agent_system.company_intelligence.reporting import usage_projection
+
+    summary["usage"] = usage_projection(doc)
+    summary["settings"] = {
+        **state.settings.model_dump(mode="json"),
+        **{
+            k: v
+            for k, v in doc.limits.items()
+            if k in type(state.settings).model_fields
+        },
     }
+    summary["error"] = doc.blocking_error
     summary["assessments"] = [
         {
             "question_id": q.question_id,
@@ -238,6 +261,11 @@ def projection(directory: Path, state: Research, doc: Document) -> None:
                     k: q.model_dump(mode="json") for k, q in doc.questions.items()
                 },
                 "interview_backlog": interview_backlog(doc),
+                "deferred_findings": {
+                    fid: disposition
+                    for fid, disposition in doc.dispositions.items()
+                    if disposition.get("disposition") == "deferred"
+                },
                 "unincorporated_findings": [
                     a.model_dump(mode="json")
                     for a in doc.assignments.values()
@@ -267,11 +295,17 @@ def persist(
     saver: SqliteSaver,
     config: RunnableConfig,
 ) -> None:
+    from agent_system.company_intelligence.findings import (
+        archive_findings,
+        reconcile_work,
+    )
     from agent_system.company_intelligence.workflow import build_research_workflow
 
+    reconcile_work(doc)
+    archive_findings(directory, doc)
     doc.revision += 1
     path = f"state/revision_{doc.revision:08d}.json"
-    save_json(directory / path, doc.model_dump(mode="json"))
+    save_json(directory / path, doc.model_dump(mode="json", exclude={"findings"}))
     state.runtime_path = path
     state.phase = (
         "orientation"
@@ -434,6 +468,7 @@ def reserve_operation(
     attempt = retry.attempt + 1 if retry else 1
     record = OperationRecord(
         operation_id=oid,
+        contract_version=session.contract_version,
         session_id=session.session_id,
         kind=kind,
         args=args,
@@ -466,6 +501,8 @@ def reserve_operation(
         metadata = read_json(directory / "calls" / trace / "metadata.json")
         metadata.update(
             {
+                "contract_version": session.contract_version,
+                "context_components": component_sizes(payload),
                 "role": session.role,
                 "effort": getattr(state.settings, f"{session.role}_effort"),
                 "assignment_id": session.session_id
@@ -571,12 +608,6 @@ def dispatch(
             "provider_capacity": exc.capacity,
             "duration": time.monotonic() - started,
         }
-    except Exception as exc:
-        receipt = {
-            "error": f"{type(exc).__name__}: {exc}",
-            "transient": False,
-            "duration": time.monotonic() - started,
-        }
     save_json(directory / op.receipt_path, receipt)
 
 
@@ -585,6 +616,29 @@ def save_capture(
 ) -> str:
     url = str(op.args["url"])
     sid = source_id(url)
+    from agent_system.company_intelligence.retrieval import (
+        SourceLimitation,
+        evidence_problem,
+    )
+
+    problem = evidence_problem(fetched)
+    if problem:
+        doc.sources[sid] = Source(
+            source_id=sid,
+            requested_url=url,
+            final_url=fetched.final_url,
+            title=fetched.title,
+            outcome="failed",
+            capture_metadata={
+                "retrieval_succeeded": True,
+                "evidence_usable": False,
+                "status_code": fetched.status_code,
+                "content_type": fetched.content_type,
+                "reason": problem,
+                "receipt": op.receipt_path,
+            },
+        )
+        raise SourceLimitation(problem)
     source = Source(
         source_id=sid,
         requested_url=url,
@@ -594,6 +648,12 @@ def save_capture(
         filename=f"sources/{sid}.md",
         cleaner_version=CLEANER_VERSION,
         outcome="success",
+        capture_metadata={
+            "retrieval_succeeded": True,
+            "evidence_usable": True,
+            "status_code": fetched.status_code,
+            "content_type": fetched.content_type,
+        },
     )
     if not any(
         v and v.strip() for v in (fetched.markdown, fetched.html, fetched.raw_html)
@@ -610,7 +670,16 @@ def save_capture(
             filename = f"sources/{sid}{suffix}"
             write_capture(artifact_path(directory, source, filename, {suffix}), value)
             setattr(source, field, filename)
-    load_cleaned(directory, source)
+    cleaned = load_cleaned(directory, source)
+    from agent_system.company_intelligence.page_content import usable
+
+    if not usable(cleaned):
+        source.outcome = "failed"
+        source.capture_metadata.update(
+            {"evidence_usable": False, "reason": "No usable cleaned evidence"}
+        )
+        doc.sources[sid] = source
+        raise SourceLimitation("No usable cleaned evidence")
     doc.sources[sid] = source
     links = discovery_links(directory, source)
     if links:
@@ -624,12 +693,15 @@ def consume_generation(
     directory: Path,
     session: Session,
     response: Generation,
+    operation_id: str = "manual",
 ) -> Document:
+    from agent_system.company_intelligence.findings import SubmissionError
+
     items = messages(directory, session) + response.output
     save_messages(directory, session, items, doc.revision + 1)
     calls = [v for v in response.output if v.get("type") == "function_call"]
     if response.status != "completed" or len(calls) != 1:
-        raise ValueError("Expected one completed structured tool submission")
+        raise SubmissionError("Expected one completed structured tool submission")
     call = calls[0]
     call_id, name, raw = (
         str(call.get("call_id", "")),
@@ -637,7 +709,137 @@ def consume_generation(
         str(call.get("arguments", "")),
     )
     if not call_id:
-        raise ValueError("Missing tool call ID")
+        raise SubmissionError("Missing tool call ID")
+    if session.contract_version >= 2:
+        from agent_system.company_intelligence.contracts import (
+            TOOL_MODELS,
+            CoordinationResult,
+            FinalResult,
+            FindingsDelta,
+            OrientationResult,
+            legacy_result,
+        )
+        from agent_system.company_intelligence.findings import (
+            SubmissionError,
+            accept_delta,
+            immutable_json,
+            incorporate,
+        )
+
+        if name != "submit":
+            available = (
+                LOCAL_TOOLS | REMOTE_TOOLS
+                if session.role == "investigator"
+                else LOCAL_TOOLS
+                if session.role == "coordinator"
+                else set()
+            )
+            if name not in available:
+                raise SubmissionError("Tool unavailable to this role")
+            action_v2 = TOOL_MODELS[name].model_validate_json(raw)
+            if session.role == "coordinator" and action_v2.delta.findings:
+                raise SubmissionError(
+                    "Coordinator saved-context actions cannot submit investigator findings"
+                )
+            accepted = (
+                accept_delta(doc, session, action_v2.delta, operation_id)
+                if session.role == "investigator"
+                else []
+            )
+            session.action = PendingAction(
+                name=name,
+                args={
+                    **action_v2.model_dump(
+                        mode="json",
+                        exclude={
+                            "reason",
+                            "remaining_question",
+                            "expected_value",
+                            "delta",
+                        },
+                        exclude_none=True,
+                    ),
+                    "_counted": True,
+                },
+                call_id=call_id,
+                reason=action_v2.reason,
+                remaining_question=action_v2.remaining_question,
+                expected_value=action_v2.expected_value,
+            )
+            session.status = "ready"
+            event(
+                doc,
+                "incremental_findings",
+                session.session_id,
+                finding_ids=list(accepted),
+                summary=f"Accepted {len(accepted)} incremental finding records",
+            )
+            return doc
+        if session.role == "orientation":
+            from agent_system.company_intelligence.handoff import accept_orientation
+
+            accept_orientation(
+                doc,
+                state,
+                directory,
+                session,
+                OrientationResult.model_validate_json(raw),
+                operation_id,
+            )
+            return doc
+        if session.role == "coordinator":
+            coordinated = CoordinationResult.model_validate_json(raw)
+            if doc.stage == "final_check" and coordinated.proposal.assignments:
+                raise SubmissionError("Final coverage check cannot launch assignments")
+            updated = incorporate(doc, coordinated, state.settings)
+            path = f"incorporations/{operation_id}.json"
+            immutable_json(directory, path, coordinated.model_dump(mode="json"))
+            if doc.batches and not doc.batches[-1].incorporated:
+                updated.batches[len(doc.batches) - 1].incorporation_path = path
+            updated.sessions[session.session_id].status = (
+                "paused" if coordinated.proposal.decision == "blocked" else "done"
+            )
+            if doc.stage == "final_check":
+                updated.final_check_done = True
+                updated.stage = (
+                    "done"
+                    if coordinated.proposal.decision != "blocked"
+                    else "final_check"
+                )
+            return updated
+        if session.role == "investigator":
+            final_result = FinalResult.model_validate_json(raw)
+            assignment = doc.assignments[session.session_id]
+            if len(final_result.findings) != len(assignment.question_ids) or {
+                f.question_id for f in final_result.findings
+            } != set(assignment.question_ids):
+                raise SubmissionError(
+                    "Final result must represent every assigned question",
+                    question_ids=list(assignment.question_ids),
+                )
+            accepted = accept_delta(
+                doc,
+                session,
+                FindingsDelta(findings=final_result.findings),
+                operation_id,
+            )
+            assignment.result = legacy_result(final_result)
+            assignment.final_result_path = f"results/{operation_id}.json"
+            immutable_json(
+                directory,
+                assignment.final_result_path,
+                {
+                    **assignment.result.model_dump(mode="json", exclude={"findings"}),
+                    "finding_ids": list(accepted),
+                },
+            )
+            assignment.status = (
+                "completed"
+                if final_result.outcome in {"completed", "exhausted"}
+                else "partial"
+            )
+            session.status = "done"
+            return doc
     if name == "act" and session.role in {"coordinator", "investigator"}:
         action = Action.model_validate_json(raw)
         if action.tool not in LOCAL_TOOLS | REMOTE_TOOLS or (
@@ -712,8 +914,24 @@ def consume_generation(
             updated.sessions[session.session_id].status = "paused"
         return updated
     elif session.role == "investigator":
-        record_findings(
-            doc, session, InvestigationResult.model_validate_json(raw), final=True
+        historical_result = InvestigationResult.model_validate_json(raw)
+        record_findings(doc, session, historical_result, final=True)
+        from agent_system.company_intelligence.contracts import (
+            EvidenceFinding,
+            FindingsDelta,
+        )
+        from agent_system.company_intelligence.findings import accept_delta
+
+        accept_delta(
+            doc,
+            session,
+            FindingsDelta(
+                findings=[
+                    EvidenceFinding.model_validate(f.model_dump())
+                    for f in historical_result.findings
+                ]
+            ),
+            operation_id,
         )
     else:
         report = ReviewReport.model_validate_json(raw)
@@ -739,6 +957,8 @@ def consume_generation(
 
 def settle_failure(doc: Document, session: Session, error: str) -> None:
     session.status = "failed"
+    if session.role in {"orientation", "coordinator", "quality"}:
+        doc.blocking_error = error
     if session.session_id in doc.assignments:
         assignment = doc.assignments[session.session_id]
         assignment.status, assignment.error = "failed", error
@@ -753,6 +973,10 @@ def consume_operation(
 ) -> Document:
     receipt = read_json(directory / op.receipt_path)
     session = doc.sessions[op.session_id]
+    if session.contract_version != op.contract_version:
+        raise RuntimeError(
+            "Operation/session contract mismatch; historical request cannot be reinterpreted"
+        )
     identifier = f"{op.operation_id}_{op.attempt}"
     error = receipt.get("error")
     if error:
@@ -830,6 +1054,9 @@ def consume_operation(
             bump(doc, session, "output_tokens", response.output_tokens)
         else:
             bump(doc, session, "unknown_requests")
+        bump(doc, session, "reasoning_tokens", response.reasoning_tokens)
+        if response.cached_tokens is not None:
+            bump(doc, session, "cached_tokens", response.cached_tokens)
         session.counted_input = None
         finish_trace(
             directory,
@@ -844,9 +1071,39 @@ def consume_operation(
             },
         )
         try:
-            doc = consume_generation(doc, state, directory, session, response)
+            doc = consume_generation(
+                doc, state, directory, session, response, identifier
+            )
             finish_trace(directory, identifier, application_status="accepted")
         except ValueError as exc:
+            from agent_system.company_intelligence.findings import SubmissionError
+
+            if session.contract_version >= 2 and not isinstance(
+                exc, (SubmissionError, ValidationError)
+            ):
+                raise
+            if session.session_id in doc.assignments:
+                from agent_system.company_intelligence.findings import (
+                    SubmissionError,
+                    immutable_json,
+                )
+
+                rejected_path = f"rejected/{identifier}.json"
+                feedback: dict[str, JsonValue] = (
+                    exc.feedback
+                    if isinstance(exc, SubmissionError)
+                    else {"reason": str(exc), "accepted": False}
+                )
+                immutable_json(
+                    directory,
+                    rejected_path,
+                    {
+                        "call_id": identifier,
+                        "feedback": feedback,
+                        "response_path": f"calls/{identifier}/response.json",
+                    },
+                )
+                doc.assignments[session.session_id].rejected_paths.append(rejected_path)
             finish_trace(
                 directory,
                 identifier,
@@ -865,7 +1122,9 @@ def consume_operation(
                         {
                             "type": "function_call_output",
                             "call_id": call.get("call_id"),
-                            "output": json.dumps({"error": str(exc)}),
+                            "output": json.dumps(
+                                {"error": str(exc), "accepted": False}
+                            ),
                         }
                     )
                 if not calls:
@@ -874,6 +1133,8 @@ def consume_operation(
                 session.status = "ready"
                 event(doc, "validation_error", session.session_id, summary=str(exc))
     else:
+        from agent_system.company_intelligence.retrieval import SourceLimitation
+
         fetched = FetchResult.model_validate(result)
         if fetched.credits is not None:
             bump(doc, session, "firecrawl_credits", fetched.credits)
@@ -903,7 +1164,7 @@ def consume_operation(
                                 {"source_id": sid},
                             ),
                         )
-            except ValueError as exc:
+            except SourceLimitation as exc:
                 doc.source_attempts.setdefault(
                     source_id(str(op.args["url"])), []
                 ).append(str(exc))
@@ -945,6 +1206,8 @@ def consume_operation(
 def schedule_session(
     doc: Document, state: Research, directory: Path, session: Session
 ) -> OperationRecord | None:
+    from agent_system.company_intelligence.findings import SubmissionError
+
     if session.operation_id:
         previous = doc.operations[session.operation_id]
         if previous.status == "reserved":
@@ -984,14 +1247,75 @@ def schedule_session(
         if action.name in LOCAL_TOOLS:
             try:
                 value = saved_action(doc, directory, session, action.name, args)
-            except ValueError as exc:
-                value = {"error": str(exc)}
+            except SubmissionError as exc:
+                value = {"error": exc.feedback}
+            event(
+                doc,
+                "local_tool_completed",
+                session.session_id,
+                tool=action.name,
+                summary=f"Performed {action.name}",
+                result=value,
+            )
             tool_output(directory, doc, session, value)
             return None
         if "url" in args:
-            args["url"] = public_url(str(args["url"]))
+            try:
+                args["url"] = public_url(str(args["url"]))
+            except ValueError as exc:
+                tool_output(
+                    directory,
+                    doc,
+                    session,
+                    {"error": str(exc), "provider_dispatched": False},
+                )
+                return None
         if action.name == "scrape_page":
             sid = source_id(str(args["url"]))
+            from agent_system.company_intelligence.retrieval import unsupported_url
+
+            if session.contract_version >= 2 and unsupported_url(str(args["url"])):
+                reason = (
+                    "PDF ingestion is unsupported; no provider request was dispatched"
+                )
+                doc.source_attempts.setdefault(sid, []).append(reason)
+                doc.sources.setdefault(
+                    sid,
+                    Source(
+                        source_id=sid,
+                        requested_url=str(args["url"]),
+                        outcome="failed",
+                        capture_metadata={
+                            "retrieval_succeeded": False,
+                            "evidence_usable": False,
+                            "reason": reason,
+                        },
+                    ),
+                )
+                event(
+                    doc,
+                    "source_limitation",
+                    session.session_id,
+                    source_id=sid,
+                    question_ids=list(doc.assignments[session.session_id].question_ids)
+                    if session.session_id in doc.assignments
+                    else [],
+                    summary=reason,
+                )
+                tool_output(
+                    directory,
+                    doc,
+                    session,
+                    {
+                        "source_id": sid,
+                        "status": "unsupported_format",
+                        "reason": reason,
+                        "provider_dispatched": False,
+                    },
+                )
+                if session.role == "orientation" and doc.orientation_queue:
+                    doc.orientation_queue.pop(0)
+                return None
             if sid in doc.sources and doc.sources[sid].outcome == "success":
                 value = (
                     saved_action(
@@ -1086,7 +1410,12 @@ def advance(doc: Document, state: Research, directory: Path) -> None:
                     continue
                 session = doc.sessions.setdefault(
                     aid,
-                    Session(session_id=aid, role="investigator", transcript_path=""),
+                    Session(
+                        session_id=aid,
+                        role="investigator",
+                        transcript_path="",
+                        contract_version=2,
+                    ),
                 )
                 if needs(
                     doc, session, [("run", "investigations", 1)], f"Launch {a.topic}"
@@ -1107,13 +1436,43 @@ def advance(doc: Document, state: Research, directory: Path) -> None:
         if not current:
             sid = f"coordinator_{sum(s.role == 'coordinator' for s in doc.sessions.values()) + 1:04d}"
             doc.sessions[sid] = Session(
-                session_id=sid, role="coordinator", transcript_path=""
+                session_id=sid,
+                role="coordinator",
+                transcript_path="",
+                contract_version=2,
             )
 
 
 def quality_preview(
     doc: Document, state: Research, batch_id: str | None = None
 ) -> dict[str, JsonValue]:
+    from agent_system.company_intelligence.findings import available_finding
+
+    def has_evidence(aid: str) -> bool:
+        assignment = doc.assignments[aid]
+        if assignment.accepted_finding_ids:
+            return any(
+                available_finding(doc, fid)
+                and doc.findings[fid].source_lineage
+                and all(
+                    str(item["source_id"]) in doc.sources
+                    and doc.sources[str(item["source_id"])].outcome == "success"
+                    for item in doc.findings[fid].source_lineage
+                )
+                for fid in assignment.accepted_finding_ids
+            )
+        return bool(
+            assignment.result
+            and any(
+                f.source_ids
+                and all(
+                    sid in doc.sources and doc.sources[sid].outcome == "success"
+                    for sid in f.source_ids
+                )
+                for f in assignment.result.findings
+            )
+        )
+
     eligible = [
         b
         for b in doc.batches
@@ -1121,7 +1480,7 @@ def quality_preview(
             doc.assignments[a].status in {"completed", "partial", "failed"}
             for a in b.assignment_ids
         )
-        and any(doc.assignments[a].status == "completed" for a in b.assignment_ids)
+        and any(has_evidence(a) for a in b.assignment_ids)
     ]
     if doc.stage != "done" or not eligible:
         raise ValueError(
@@ -1145,6 +1504,13 @@ def quality_preview(
         )
     sources = sorted(
         {sid for aid in batch.assignment_ids for sid in doc.assignments[aid].sources}
+        | {
+            str(item["source_id"])
+            for aid in batch.assignment_ids
+            for fid in doc.assignments[aid].accepted_finding_ids
+            if fid in doc.findings
+            for item in doc.findings[fid].source_lineage
+        }
     )
     return {
         "batch_id": batch.batch_id,
@@ -1227,7 +1593,10 @@ def apply_commands(doc: Document, state: Research, directory: Path) -> None:
                         else [],
                     )
                     doc.sessions[rid] = Session(
-                        session_id=rid, role="quality", transcript_path=""
+                        session_id=rid,
+                        role="quality",
+                        transcript_path="",
+                        contract_version=2,
                     )
                 doc.applied_commands[cid] = "applied"
             except ValueError as exc:
@@ -1246,6 +1615,7 @@ def run(
     *,
     max_steps: int | None = None,
 ) -> Research:
+    from agent_system.company_intelligence.findings import SubmissionError
     from agent_system.company_intelligence.workflow import load_research
 
     directory = data_dir / "jobs" / job_id
@@ -1287,20 +1657,22 @@ def run(
         if recovered:
             persist(directory, state, doc, saver, config)
         steps = 0
-        last_tick = time.monotonic()
+        from agent_system.company_intelligence.timing import (
+            ActiveClock,
+            research_signature,
+        )
+
+        clock = ActiveClock(directory, doc)
         last_heartbeat = 0.0
+        fatal_error: str | None = None
         try:
             while True:
-                before_document = doc.model_dump_json(exclude={"revision"})
+                before_document = research_signature(doc)
                 current = time.monotonic()
                 active = bool(futures) or any(
                     s.status == "ready" for s in doc.sessions.values()
                 )
-                if active:
-                    doc.usage["active_seconds"] = (
-                        doc.usage.get("active_seconds", 0) + current - last_tick
-                    )
-                last_tick = current
+                clock.tick(doc, active)
                 if current - last_heartbeat >= 1:
                     save_json(
                         directory / "worker.json",
@@ -1330,10 +1702,12 @@ def run(
                             scheduled = schedule_session(doc, state, directory, session)
                             if scheduled:
                                 ready.append(scheduled)
-                        except ValueError as exc:
+                        except SubmissionError as exc:
                             settle_failure(doc, session, str(exc))
-                changed = doc.model_dump_json(exclude={"revision"}) != before_document
+                changed = research_signature(doc) != before_document
                 if changed or ready:
+                    clock.tick(doc, bool(futures) or bool(ready))
+                    clock.flush()
                     persist(directory, state, doc, saver, config)
                 # A dispatch marker is durable before the external call can begin.
                 for op in ready:
@@ -1375,7 +1749,11 @@ def run(
                 if not futures and not actionable:
                     if (
                         doc.stage == "done"
-                        or any(s.status == "failed" for s in doc.sessions.values())
+                        or any(
+                            s.status == "failed"
+                            and s.role in {"orientation", "coordinator"}
+                            for s in doc.sessions.values()
+                        )
                         or providers is not None
                     ):
                         break
@@ -1390,9 +1768,20 @@ def run(
                 summary="Worker stopped; completed receipts remain recoverable",
             )
             persist(directory, state, doc, saver, config)
+        except Exception as exc:
+            # Add a diagnostic while preserving the original exception and the
+            # last checkpoint/receipts. Never commit partially applied state.
+            fatal_error = f"{type(exc).__name__}: {exc}"
+            raise
         finally:
+            clock.close(doc)
             save_json(
                 directory / "worker.json",
-                {"heartbeat": now(), "active": False, "online": False},
+                {
+                    "heartbeat": now(),
+                    "active": False,
+                    "online": False,
+                    "error": fatal_error,
+                },
             )
         return state

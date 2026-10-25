@@ -123,7 +123,12 @@ def validate_plans(state: Research, plans: list[PlannedInvestigation]) -> None:
 
 
 def apply_submission(
-    state: Research, submission: OrientationSubmission, directory: Path
+    state: Research,
+    submission: OrientationSubmission,
+    directory: Path,
+    *,
+    require_plans: bool = True,
+    write_snapshot: bool = True,
 ) -> None:
     ids = [item.question_id for item in submission.assessments]
     if len(ids) != len(QUESTIONS) or set(ids) != set(QUESTIONS):
@@ -141,7 +146,8 @@ def apply_submission(
                 "Assessment requires an answer, gap or not-applicable reason"
             )
         if (
-            assessment.status in {"partial", "unassessed"}
+            require_plans
+            and assessment.status in {"partial", "unassessed"}
             and assessment.question_id not in planned
         ):
             raise ValueError("Unresolved questions require focused plans")
@@ -194,7 +200,8 @@ def apply_submission(
         "discovery": state.discovery,
         "contradictions": submission.contradictions,
     }
-    save_json(directory / "orientation.json", snapshot)
+    if write_snapshot:
+        save_json(directory / "orientation.json", snapshot)
     state.profile = profile
     state.assessments = submission.assessments
     state.investigation_plan = entries

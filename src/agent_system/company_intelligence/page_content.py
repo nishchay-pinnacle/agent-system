@@ -19,7 +19,7 @@ from agent_system.company_intelligence.html_cleaning import (
 )
 from agent_system.company_intelligence.schemas import Source
 
-CLEANER_VERSION = "3"
+CLEANER_VERSION = "4"
 
 
 def digest(text: str) -> str:
@@ -169,12 +169,15 @@ def artifact_path(
 def cleaned_path(directory: Path, source: Source) -> Path:
     suffix = (
         f".cleaned.v{source.cleaner_version}.md"
-        if source.cleaner_version in {"2", "3"}
+        if source.cleaner_version in {"2", "3", "4"}
         else ".cleaned.md"
     )
     filename = source.cleaned_filename or f"sources/{source.source_id}{suffix}"
     return artifact_path(
-        directory, source, filename, {".cleaned.md", ".cleaned.v2.md", ".cleaned.v3.md"}
+        directory,
+        source,
+        filename,
+        {".cleaned.md", ".cleaned.v2.md", ".cleaned.v3.md", ".cleaned.v4.md"},
     )
 
 
@@ -215,14 +218,16 @@ def load_cleaned(directory: Path, source: Source) -> str:
         source.cleaned_hash = digest(content)
         if source.cleaner_version is None:
             source.cleaner_version = (
-                "3"
+                "4"
+                if path.name.endswith(".v4.md")
+                else "3"
                 if path.name.endswith(".v3.md")
                 else "2"
                 if path.name.endswith(".v2.md")
                 else "1"
             )
         source.cleaned_filename = f"sources/{path.name}"
-        if source.cleaner_version in {"2", "3"}:
+        if source.cleaner_version in {"2", "3", "4"}:
             report_name = (
                 f"sources/{source.source_id}.cleaning.v{source.cleaner_version}.json"
             )
@@ -230,7 +235,7 @@ def load_cleaned(directory: Path, source: Source) -> str:
                 directory,
                 source,
                 report_name,
-                {".cleaning.v2.json", ".cleaning.v3.json"},
+                {".cleaning.v2.json", ".cleaning.v3.json", ".cleaning.v4.json"},
             )
             if report_path.exists():
                 report = read_json(report_path)
@@ -244,9 +249,9 @@ def load_cleaned(directory: Path, source: Source) -> str:
     if source.cleaner_version in {None, "1"}:
         cleaned = clean_markdown_v1(raw)
         source.cleaner_version = "1"
-    elif source.cleaner_version == "2":
+    elif source.cleaner_version in {"2", "3"}:
         raise ValueError(
-            "Missing historical v2 cleaned file; restore it from backup rather than recleaning with v3"
+            f"Missing historical v{source.cleaner_version} cleaned file; restore it from backup rather than recleaning with v4"
         )
     elif source.cleaner_version == CLEANER_VERSION:
         cleaned = clean_new(directory, source, raw)
@@ -370,7 +375,10 @@ def clean_new(directory: Path, source: Source, markdown: str) -> str:
         "link_provenance": [dict(link) for link in result.links],
     }
     report_path = artifact_path(
-        directory, source, report_name, {".cleaning.v2.json", ".cleaning.v3.json"}
+        directory,
+        source,
+        report_name,
+        {".cleaning.v2.json", ".cleaning.v3.json", ".cleaning.v4.json"},
     )
     if not report_path.exists():
         save_json(report_path, report)
@@ -391,7 +399,7 @@ def discovery_links(directory: Path, source: Source) -> list[dict[str, str]]:
             directory,
             source,
             source.cleaning_report_filename,
-            {".cleaning.v2.json", ".cleaning.v3.json"},
+            {".cleaning.v2.json", ".cleaning.v3.json", ".cleaning.v4.json"},
         )
     )
     links = report.get("discovery_links", [])

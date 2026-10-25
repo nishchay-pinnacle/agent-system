@@ -144,7 +144,7 @@ handled without inventing historical execution.
 ## Cleaning and result interpretation
 
 Each scrape requests Markdown, HTML and raw HTML in one call without main-content
-filtering. Cleaner v3 prefers usable HTML, then raw HTML, then conservative Markdown.
+filtering. Cleaner v4 prefers usable HTML, then raw HTML, then conservative Markdown.
 Structural rules remove confirmed interface controls while preserving substantive
 prose, code, tables, hidden answers/variants, qualifiers and accessible labels. Complex
 tables retain semantic HTML, displayed as escaped text in the dashboard. Removed
@@ -158,7 +158,7 @@ Ambiguous DOM components survive; legacy Markdown lacks structural signals. Cont
 loaded only after JavaScript interaction, diagrams and media may require further
 inspection. Empty/loading/error captures block successful source delivery. Existing
 cleaned filenames and bytes are honored; missing v1 copies use the original v1
-algorithm. Existing v2 copies are preserved; a missing v2 copy must be restored
+algorithm. Existing v2/v3 copies are preserved; a missing historical copy must be restored
 from backup rather than regenerated under new rules. No automatic recleaning, historical output migration or research rerun occurs.
 
 For legacy runs, `result.json` projects every partial/unassessed assessment into `consequential_gaps`,
@@ -229,8 +229,8 @@ connections are created during imports. This is the editable local `uv sync` set
 - `checkpoints.sqlite`: authoritative LangGraph workflow state.
 - `jobs/<job_id>/sources/<source_id>.md`: original fetched Markdown.
 - `sources/<source_id>.html` and `.raw.html`: unmodified HTML captures, when returned.
-- `sources/<source_id>.cleaned.v3.md`: canonical cleaned evidence; legacy `.cleaned.md` stays readable.
-- `sources/<source_id>.cleaning.v3.json`: representation choice, hashes/counts, structural
+- `sources/<source_id>.cleaned.v4.md`: canonical cleaned evidence; legacy `.cleaned.md` stays readable.
+- `sources/<source_id>.cleaning.v4.json`: representation choice, hashes/counts, structural
   rule removals, warnings, navigation leads, asset locators and labelled JSON-LD metadata.
 - `sources.json`, `profile.json`: source manifest with representation, cleaner version,
   SHA-256 hashes and byte/line statistics; current eight-section profile.
@@ -426,3 +426,71 @@ uv run python -m agent_system.worker research --orientation-only \
 
 Replace example inputs before use. Omit `--orientation-only` only when authorizing the
 full research budget. A quality check additionally requires its explicit dashboard action.
+
+## Coordinated contract fixes
+
+New sessions use role contract 2 within workflow schema 3. Missing version fields mean
+contract 1: pending historical calls, retries and active protocol continuations keep
+their issued schemas/validators. Later sessions use contract 2. Model settings and
+limits remain those saved with the job. Legacy workflow versions 1–2 retain their
+execution semantics. No historical captures, call traces, orientation snapshots,
+results, or usage totals are rewritten or automatically recleaned.
+
+Orientation now requires specific missing information for every unresolved assessment,
+while investigation proposals are optional. Its immutable original output includes
+actual delivered evidence hashes/cleaner versions, discovery, and exact accepted-call
+links. System distinguishes this snapshot from current understanding. Old snapshots
+without that provenance display it as unavailable rather than inventing it.
+
+Investigators use named tools with exact arguments and may attach a small `delta` of
+per-question findings to ordinary tool calls. Accepted findings receive stable IDs and
+are stored in `findings/` once. Final results reference those IDs. Rejected candidates
+remain separate under `rejected/`; they cannot replace accepted partial findings.
+Inherited finding references preserve source/hash lineage without claiming a direct
+page read. New direct source claims require inspected evidence.
+
+Each coordinator incorporation explicitly accounts for every pending finding, including
+retained deferrals. Question/profile revisions name their prior revision and supporting
+or retired finding IDs; untouched understanding remains intact. Batch incorporation
+records are available in System and `incorporations/`. Existing results with ambiguous
+acceptance are labelled `legacy_unverified` until explicitly addressed, not silently
+promoted into trusted inherited evidence.
+
+Retrieval success is separate from evidence usability. Status/content-type metadata and
+available rejected capture bytes stay archived. Known PDF URLs remain discovery leads;
+unsupported ingestion returns a recorded limitation without a provider request. Expected
+source limitations allow investigation/coordinator continuation; programming, storage,
+and integrity failures stop visibly. Captures with evidence of explicit error/access
+pages are excluded from citations. Legitimate error-handling articles and substantive
+category pages remain eligible.
+
+Cleaner 4 removes structurally identified documentation controls, preserving article
+prose, examples, warnings, tables, relevant navigation and discovery leads. Saved cleaner
+1–3 evidence keeps its original bytes and version.
+
+The small `timing.json` ledger is written separately from research revisions. Dispatch
+intent/reservations and receipts remain durable; elapsed-time ticks alone no longer
+create full checkpoints. Restart conservatively accounts for up to one interrupted
+active ledger interval, excluding worker downtime and approval-only waiting. The
+saved dashboard and System use one usage projection; cached input/reasoning output
+are subsets, and unavailable historical detail remains unknown.
+
+Explicit Sol reviews may include finalized settled batches with usable accepted partial
+findings. Failed-only batches without evidence remain ineligible. Reviews retain frozen
+inputs, existing allowances, one generation plus bounded transient retry, no retrieval,
+and no automatic corrections or model escalation.
+
+Offline regression measurements use deterministic synthetic fixtures (not production
+performance claims): equivalent investigator briefing 322,795 → 3,625 UTF-8 bytes,
+with the full 8,780-byte page preserved; simulated long-call research revisions
+60 → 4 and revision bytes 2,274,600 → 146,476. Reproduce with:
+
+```bash
+uv run pytest tests/test_research_fixes.py -q -s
+```
+
+These fixes enforce mechanical evidence/reference/storage contracts. Repeated technical
+question selection, unnecessary singleton batches, stopping before useful leads, weak
+semantic synthesis and sparse voluntary findings remain behaviors to evaluate in a
+separately authorized stronger-model trial. No rules force more work, parallelism,
+budget increases, or automatic Sol calls.

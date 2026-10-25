@@ -100,7 +100,7 @@ def test_full_orientation_inventory_and_reopen(tmp_path: Path) -> None:
         and "FINAL FACT" not in done.model_dump_json()
     )
     assert (directory / "sources" / f"{SID}.md").read_bytes() == LONG_PAGE.encode()
-    assert "FINAL FACT" in (directory / "sources" / f"{SID}.cleaned.v3.md").read_text()
+    assert "FINAL FACT" in (directory / "sources" / f"{SID}.cleaned.v4.md").read_text()
     snapshot = (directory / "orientation.json").read_bytes()
     assert len(json.loads(snapshot)["assessments"]) == 49
     calls = call_summaries(directory)["calls"]
@@ -192,7 +192,7 @@ def test_oversize_and_missing_required_page(tmp_path: Path) -> None:
     assert (
         "FINAL FACT"
         in (
-            tmp_path / "jobs" / initial.job_id / "sources" / f"{SID}.cleaned.v3.md"
+            tmp_path / "jobs" / initial.job_id / "sources" / f"{SID}.cleaned.v4.md"
         ).read_text()
     )
 

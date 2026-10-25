@@ -181,7 +181,7 @@ def saved_source(
         source_id=SID,
         requested_url=URL,
         filename=f"sources/{SID}.md",
-        cleaner_version="3",
+        cleaner_version="4",
         outcome="success",
     )
     (directory / source.filename).write_bytes(markdown.encode())
@@ -250,7 +250,7 @@ def test_selection_reports_conversion_failure_and_legacy(
     reopened.cleaned_filename = "sources/../../secret"
     with pytest.raises(ValueError):
         cleaned_path(legacy_dir, reopened)
-    reopened.cleaned_filename = f"sources/{SID}.cleaned.v3.md"
+    reopened.cleaned_filename = f"sources/{SID}.cleaned.v4.md"
     (legacy_dir / reopened.cleaned_filename).symlink_to(tmp_path / "outside")
     with pytest.raises(ValueError):
         cleaned_path(legacy_dir, reopened)
@@ -304,7 +304,7 @@ def test_all_formats_one_sdk_call_shared_delivery(
         == delivery["content_hash"]
         == digest(load_cleaned(directory, source))
     )
-    assert page["cleaner_version"] == delivery["cleaner_version"] == "3"
+    assert page["cleaner_version"] == delivery["cleaner_version"] == "4"
     assert page["cleaning_summary"] == delivery["cleaning_summary"]
     assert search_inventory(directory, "documentation")["entries"]
     before = {str(p): p.read_bytes() for p in directory.rglob("*") if p.is_file()}

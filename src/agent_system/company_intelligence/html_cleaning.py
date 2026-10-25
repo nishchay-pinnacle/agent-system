@@ -436,6 +436,66 @@ def clean_html(raw: str, page_url: str, source_id: str) -> HTMLResult:
         ):
             remove(shell, "share_widget_shell")
 
+    # Documentation sidebars are explicit navigation landmarks, not category content.
+    for region in list(soup.find_all(["aside", "nav"])):
+        if region.parent is None or region.find_parent(
+            ["article", "pre", "code", "table", "blockquote"]
+        ):
+            continue
+        label = attr(region, "aria-label").strip().casefold()
+        documentation_nav = label in {
+            "article navigation",
+            "documentation navigation",
+            "docs navigation",
+            "sidebar navigation",
+        }
+        if documentation_nav and region.find("a") and soup.find(["article", "main"]):
+            discovery(region)
+            remove(region, "documentation_sidebar")
+    control_labels = {
+        "search",
+        "open search",
+        "theme options",
+        "toggle theme",
+        "change theme",
+        "toggle dark mode",
+        "copy link",
+        "copy article link",
+        "share article",
+        "category more options",
+        "expand category",
+        "collapse category",
+        "open menu",
+        "close menu",
+    }
+    for control in list(soup.find_all(["button", "input"])):
+        if control.parent is None or control.find_parent(
+            ["pre", "code", "table", "blockquote"]
+        ):
+            continue
+        label = attr(control, "aria-label").strip().casefold()
+        menu_choice = attr(
+            control, "role"
+        ) == "menuitemradio" and not control.find_parent("article")
+        if label not in control_labels and not menu_choice:
+            continue
+        described = attr(control, "aria-describedby").split()
+        discovery(control)
+        remove(control, "documentation_interface_control")
+        for identifier in described:
+            hint = soup.find(id=identifier)
+            if hint and not hint.find(["a", "pre", "code", "table", "article"]):
+                remove(hint, "control_shortcut_hint")
+    for shell in reversed(list(soup.find_all(["div", "span"]))):
+        if (
+            shell.parent is not None
+            and not shell.get_text(strip=True)
+            and not shell.find(
+                ["a", "img", "svg", "pre", "code", "table", "iframe", "input", "button"]
+            )
+        ):
+            remove(shell, "empty_control_container")
+
     # Breadcrumb trail requires an explicit landmark/label; preserve hierarchy in metadata.
     for tag in list(soup.find_all(True)):
         if tag.parent is None or tag.find_parent(["pre", "code"]):

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import re
 import secrets
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,6 +41,30 @@ def job_directory(data_dir: Path, job_id: str) -> Path:
     if directory.is_symlink() or not (directory / "dashboard.json").is_file():
         raise ValueError("Research job not found")
     return directory
+
+
+def read_dashboard(directory: Path) -> dict[str, JsonValue]:
+    dashboard = read_json(safe_path(directory, "dashboard.json"))
+    worker_path = directory / "worker.json"
+    if worker_path.exists():
+        worker = read_json(worker_path)
+        if worker.get("error") and not worker.get("online"):
+            dashboard["error"] = worker["error"]
+            dashboard["status"] = "blocked_by_error"
+    timing = directory / "timing.json"
+    if dashboard.get("schema_version") == 3 and timing.exists():
+        ledger = read_json(timing)
+        total = ledger.get("total_seconds")
+        if isinstance(total, (int, float)):
+            usage = dashboard.get("usage")
+            if isinstance(usage, dict):
+                usage["active_seconds"] = total
+            system = dashboard.get("system")
+            if isinstance(system, dict):
+                current = system.get("usage")
+                if isinstance(current, dict):
+                    current["active_seconds"] = total
+    return dashboard
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -83,7 +108,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
                 return
             if route == "/api/system":
-                dashboard = read_json(safe_path(self.directory, "dashboard.json"))
+                dashboard = read_dashboard(self.directory)
                 system = dashboard.get("system")
                 worker_path = self.directory / "worker.json"
                 commands: list[JsonValue] = []
@@ -107,6 +132,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "job_id": dashboard["job_id"],
                         "status": dashboard["status"],
                         "settings": dashboard["settings"],
+                        "usage": dashboard.get("usage", {}),
+                        "error": dashboard.get("error"),
                         "worker": read_json(worker_path)
                         if worker_path.exists()
                         else {},
@@ -114,15 +141,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "commands": commands,
                     },
                 )
+            elif route.startswith("/api/artifact/"):
+                relative = route.removeprefix("/api/artifact/")
+                if not re.fullmatch(
+                    r"(?:findings|rejected|incorporations|results)/[A-Za-z0-9_-]+\.json",
+                    relative,
+                ):
+                    raise ValueError("Unsupported artifact reference")
+                self.send_json(200, read_json(safe_path(self.directory, relative)))
             elif route == "/api/quality-preview":
-                dashboard = read_json(safe_path(self.directory, "dashboard.json"))
+                dashboard = read_dashboard(self.directory)
                 state = Research.model_validate(
                     {
                         "instructions": "",
                         **{
                             k: v
                             for k, v in dashboard.items()
-                            if k not in {"system", "assessments"}
+                            if k not in {"system", "assessments", "usage"}
                         },
                     }
                 )
@@ -161,7 +196,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     200, read_json(safe_path(self.directory, "orientation.json"))
                 )
             elif route == "/api/state":
-                dashboard = read_json(safe_path(self.directory, "dashboard.json"))
+                dashboard = read_dashboard(self.directory)
                 records = sorted((self.directory / "investigations").glob("*.json"))[
                     -12:
                 ]
@@ -214,7 +249,40 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if representation not in {"raw", "cleaned"}:
                     raise ValueError("Unknown representation")
                 if source.outcome != "success":
-                    raise ValueError("Source has no successful saved scrape")
+                    receipt = source.capture_metadata.get("receipt")
+                    if representation == "raw" and isinstance(receipt, str):
+                        saved = read_json(safe_path(self.directory, receipt)).get(
+                            "result", {}
+                        )
+                        captured = saved if isinstance(saved, dict) else {}
+                        self.send_json(
+                            200,
+                            {
+                                "source_id": sid,
+                                "title": source.title,
+                                "url": source.requested_url,
+                                "representation": "raw; unusable capture",
+                                "start_line": 1,
+                                "end_line": 1,
+                                "total_lines": 1,
+                                "content": str(
+                                    captured.get("markdown")
+                                    or captured.get("html")
+                                    or captured.get("raw_html")
+                                    or source.capture_metadata.get("reason")
+                                ),
+                                "more": False,
+                                "evidence_usable": False,
+                                "metadata": source.capture_metadata,
+                            },
+                        )
+                        return
+                    raise ValueError(
+                        str(
+                            source.capture_metadata.get("reason")
+                            or "Source has no usable saved evidence"
+                        )
+                    )
                 if representation == "cleaned" and not source.cleaned_filename:
                     self.send_json(
                         404,
@@ -285,7 +353,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not 0 < length <= 16384:
                 raise ValueError("Invalid command size")
             command = UserCommand.model_validate_json(self.rfile.read(length))
-            dashboard = read_json(safe_path(self.directory, "dashboard.json"))
+            dashboard = read_dashboard(self.directory)
             if (
                 command.job_id != dashboard["job_id"]
                 or self.path != f"/api/jobs/{command.job_id}/commands"

@@ -139,6 +139,36 @@ class FakeProviders:
                 remaining_uncertainty="Deployment conditions",
                 outcome="completed",
             )
+        revised = (
+            "current_understanding" in payload
+            or state.phase == "orientation"
+            and "sources" in payload
+        )
+        if revised and state.phase == "orientation":
+            for assessment in output["assessments"]:
+                assessment["missing"] = (
+                    "Specific deployment conditions remain unconfirmed"
+                )
+        if revised and state.phase == "between":
+            output = dict(
+                proposal=output,
+                changes=[],
+                profile_changes=[],
+                dispositions=[
+                    dict(
+                        finding_id=fid,
+                        disposition="deferred",
+                        reason="Company confirmation is still needed",
+                        reference_ids=[],
+                    )
+                    for fid in payload["pending_finding_ids"]
+                ],
+            )
+        if revised and name == "act":
+            name = output.pop("tool")
+            output.update(output.pop("arguments"))
+            previous = output.pop("findings", None)
+            output["delta"] = {"findings": previous["findings"] if previous else []}
         return Generation(
             output=[
                 {
@@ -270,15 +300,14 @@ def test_local_decline_retains_incremental_findings(tmp_path: Path) -> None:
             ):
                 result = json.loads(response.output[0]["arguments"])
                 result["outcome"] = "progress"
-                response.output[0]["name"] = "act"
+                response.output[0]["name"] = "read_profile"
                 response.output[0]["arguments"] = json.dumps(
                     dict(
-                        tool="read_profile",
-                        arguments={"area": "scope"},
+                        area="scope",
                         reason="Check saved boundary assumptions",
                         remaining_question="Deployment conditions",
                         expected_value="Resolve conditions against the profile",
-                        findings=result,
+                        delta={"findings": result["findings"]},
                     )
                 )
             return response
@@ -289,7 +318,7 @@ def test_local_decline_retains_incremental_findings(tmp_path: Path) -> None:
     directory = tmp_path / "jobs" / state.job_id
     doc = load_document(directory, paused)
     assert paused.status == "paused"
-    assert all(a.result and a.result.findings for a in doc.assignments.values())
+    assert all(a.accepted_finding_ids for a in doc.assignments.values())
     for approval in doc.approvals:
         enqueue(
             directory,
@@ -305,7 +334,10 @@ def test_local_decline_retains_incremental_findings(tmp_path: Path) -> None:
     call_count = sum(c.phase == "investigation" for c in fake.calls)
     done = run_research(tmp_path, state.job_id, providers=fake)
     doc = load_document(directory, done)
-    assert all(a.status == "partial" and a.result for a in doc.assignments.values())
+    assert all(
+        a.status == "partial" and a.accepted_finding_ids
+        for a in doc.assignments.values()
+    )
     assert sum(c.phase == "investigation" for c in fake.calls) == call_count
     assert set(doc.declined_questions) == {"S1", "S2", "C1"}
 
@@ -374,7 +406,7 @@ def test_completed_receipt_resume_in_fresh_process(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "completed"
-    assert (directory / "sources" / f"{SID}.cleaned.v3.md").exists()
+    assert (directory / "sources" / f"{SID}.cleaned.v4.md").exists()
 
 
 def test_uncertain_call_keeps_reservation(tmp_path: Path) -> None:

@@ -33,6 +33,8 @@ class Dependency(StrictModel):
 
 
 class Question(StrictModel):
+    revision: int = 0
+    qualifications: str = ""
     question_id: str
     text: str
     area: SectionKey
@@ -103,6 +105,9 @@ class Assignment(AssignmentSpec):
     status: Literal[
         "pending", "running", "paused", "completed", "partial", "failed"
     ] = "pending"
+    accepted_finding_ids: list[str] = Field(default_factory=list)
+    rejected_paths: list[str] = Field(default_factory=list)
+    final_result_path: str | None = None
     result: InvestigationResult | None = None
     sources: list[str] = Field(default_factory=list)
     usage: dict[str, int] = Field(default_factory=dict)
@@ -114,6 +119,7 @@ class Batch(StrictModel):
     batch_id: str
     assignment_ids: list[str]
     incorporated: bool = False
+    incorporation_path: str | None = None
 
 
 class Merge(StrictModel):
@@ -181,6 +187,9 @@ class PendingAction(StrictModel):
 
 
 class Session(StrictModel):
+    contract_version: int = 1
+    delivered_hashes: dict[str, str] = Field(default_factory=dict)
+    inherited_finding_ids: list[str] = Field(default_factory=list)
     session_id: str
     role: Literal["orientation", "coordinator", "investigator", "quality"]
     transcript_path: str
@@ -194,6 +203,7 @@ class Session(StrictModel):
 
 
 class OperationRecord(StrictModel):
+    contract_version: int = 1
     operation_id: str
     session_id: str
     kind: str
@@ -233,7 +243,26 @@ class Approval(StrictModel):
     decided_at: str | None = None
 
 
+class FindingRecord(StrictModel):
+    finding_id: str
+    assignment_id: str
+    operation_id: str
+    content: Finding
+    inherited_finding_ids: list[str] = Field(default_factory=list)
+    supersedes: list[str] = Field(default_factory=list)
+    source_lineage: list[dict[str, JsonValue]] = Field(default_factory=list)
+    acceptance: Literal["accepted", "legacy_unverified"] = "accepted"
+
+
 class Document(StrictModel):
+    storage_version: int = 1
+    finding_paths: dict[str, str] = Field(default_factory=dict)
+    findings: dict[str, FindingRecord] = Field(default_factory=dict)
+    dispositions: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
+    profile_findings: dict[str, list[str]] = Field(default_factory=dict)
+    orientation_path: str | None = None
+    history_paths: dict[str, str] = Field(default_factory=dict)
+    blocking_error: str | None = None
     revision: int = 0
     profile_version: int = 0
     profile: dict[SectionKey, Section] = Field(
@@ -333,9 +362,11 @@ def apply_proposal(
             for qid in assignment.question_ids:
                 question = doc.questions[qid]
                 question.history.append(
-                    f"{aid}: {assignment.result.model_dump_json() if assignment.result else assignment.error}"
+                    f"Assignment {aid}: {assignment.status}"
+                    if doc.storage_version >= 2
+                    else f"{aid}: {assignment.result.model_dump_json() if assignment.result else assignment.error}"
                 )
-                if assignment.result:
+                if assignment.result and doc.storage_version < 2:
                     question.finding_ids.append(aid)
                 if question.answer_status in {"unassessed", "partial"}:
                     question.work_status = (

@@ -75,9 +75,11 @@ from agent_system.company_intelligence.tools import (
     RETRIEVALS,
     TOOL_MODELS,
     excerpt,
-    public_url,
     source_id,
     tool_definitions,
+)
+from agent_system.company_intelligence.tools import (
+    legacy_public_url as public_url,
 )
 
 JSON_MESSAGES = TypeAdapter(list[dict[str, JsonValue]])
