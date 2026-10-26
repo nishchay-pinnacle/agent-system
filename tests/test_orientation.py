@@ -350,3 +350,37 @@ def test_conversion_failure_falls_back_to_saved_markdown(
     assert result["content"] == "Saved fallback evidence"
     metadata = read_json(directory, f"sources/{source_id(run.inputs.company_url)}.json")
     assert "protected block" in str(metadata["fallback_reasons"])
+
+
+def test_sdk_output_with_null_optionals_replays_after_resume(tmp_path: Path) -> None:
+    from openai.types.responses import ResponseFunctionToolCall
+
+    from research_agent.agent import CREATE_PARAMS
+
+    class SDKModel(FakeModel):
+        def generate(self, request: dict[str, JsonValue]) -> dict[str, JsonValue]:
+            CREATE_PARAMS.validate_python(request)
+            response = super().generate(request)
+            call = response["output"][0]
+            response["output"] = [
+                ResponseFunctionToolCall.model_validate(
+                    {**call, "id": "fc_test"}
+                ).model_dump(mode="json")
+            ]
+            return response
+
+    directory, run, _, pages = setup_run(tmp_path)
+    model = SDKModel(run.inputs)
+    pages.fail_url = run.inputs.company_url
+    with pytest.raises(ValueError, match="unusable"):
+        execute(directory, run, model, pages)
+    saved = read_json(directory, "debug/turn-0000.response.json")
+    assert saved["items"][0]["namespace"] is None
+    reopened = Run.model_validate(read_json(directory, "run.json"))
+    fresh_model = SDKModel(run.inputs)
+    execute(directory, reopened, fresh_model, FakePages())
+    assert reopened.status == "complete"
+    replay = fresh_model.requests[0]["input"][1]
+    assert "namespace" not in replay
+    assert replay["call_id"] == "call-0"
+    assert read_json(directory, "debug/turn-0000.response.json") == saved

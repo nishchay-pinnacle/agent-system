@@ -102,8 +102,15 @@ def run_agent(directory: Path, run: Run, model: Model, tools: OrientationTools) 
         if not local_path(directory, response_name).exists():
             items: list[dict[str, JsonValue]] = []
             for reference in state["history"]:
+                saved_items = JSON_ITEMS.validate_python(
+                    read_json(directory, reference)["items"]
+                )
+                # SDK response objects serialize absent optional fields as null,
+                # while input TypedDicts require those fields to be omitted.
+                # Normalize replay only; retain the original response on disk.
                 items.extend(
-                    JSON_ITEMS.validate_python(read_json(directory, reference)["items"])
+                    {key: value for key, value in item.items() if value is not None}
+                    for item in saved_items
                 )
             request: dict[str, JsonValue] = {
                 "model": run.settings.model,
