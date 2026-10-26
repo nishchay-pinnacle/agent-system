@@ -9,7 +9,7 @@ import socket
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import (
@@ -169,3 +169,27 @@ def run_lock(directory: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+class FirecrawlCounts(BaseModel):
+    scrape: int = Field(default=0, ge=0)
+    map: int = Field(default=0, ge=0)
+    complete_history: bool = False
+
+
+def firecrawl_counts(directory: Path) -> FirecrawlCounts:
+    if not local_path(directory, "debug/firecrawl-counts.json").exists():
+        return FirecrawlCounts()
+    return FirecrawlCounts.model_validate(
+        read_json(directory, "debug/firecrawl-counts.json")
+    )
+
+
+def record_firecrawl_call(directory: Path, operation: Literal["scrape", "map"]) -> None:
+    counts = firecrawl_counts(directory)
+    if operation == "scrape":
+        counts.scrape += 1
+    else:
+        counts.map += 1
+    # Reserve before calling so failed requests also count across resume.
+    save_json(directory, "debug/firecrawl-counts.json", counts.model_dump())

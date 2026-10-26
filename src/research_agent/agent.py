@@ -16,6 +16,7 @@ from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from research_agent.cli import CLI
 from research_agent.storage import (
+    FirecrawlCounts,
     Run,
     local_path,
     read_json,
@@ -70,6 +71,11 @@ def initialize_prompts(directory: Path, run: Run) -> None:
         package.joinpath("prompts/user.md")
         .read_text()
         .format(**run.inputs.model_dump())
+    )
+    save_json(
+        directory,
+        "debug/firecrawl-counts.json",
+        FirecrawlCounts(complete_history=True).model_dump(),
     )
     # Freeze loaded instructions so resume uses the same task and skill.
     write_text(directory, "system.md", system + "\n\n" + skill)

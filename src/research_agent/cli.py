@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pydantic import JsonValue
 
-from research_agent.storage import read_json
+from research_agent.storage import Run, firecrawl_counts, read_json
 
 
 def configure_logging() -> None:
@@ -33,6 +33,7 @@ class CLI:
         self.input_tokens = 0
         self.output_tokens = 0
         self.unknown_calls = 0
+        self.responses = 0
         if directory is not None:
             for path in sorted((directory / "debug").glob("call-*.response.json")):
                 self.add_usage(read_json(directory, f"debug/{path.name}").get("usage"))
@@ -58,6 +59,7 @@ class CLI:
         )
 
     def add_usage(self, usage: JsonValue) -> bool:
+        self.responses += 1
         if not isinstance(usage, dict):
             self.unknown_calls += 1
             return False
@@ -96,6 +98,27 @@ class CLI:
                 f"{self.unknown_calls} response(s); excluded from totals"
             )
         self.event("Model result", "Response received", details)
+
+    def summary(self, directory: Path, status: str) -> None:
+        run = Run.model_validate(read_json(directory, "run.json"))
+        counts = firecrawl_counts(directory)
+        missing = self.unknown_calls + max(0, run.model_calls - self.responses)
+        total_calls = run.model_calls + counts.scrape + counts.map
+        details: dict[str, object] = {
+            "Total tokens (reported)": f"{self.input_tokens + self.output_tokens:,}",
+            "Input / output tokens": f"{self.input_tokens:,} / {self.output_tokens:,}",
+            "Model requests": run.model_calls,
+            "Firecrawl requests": f"{counts.scrape} scrape · {counts.map} map",
+            "Total API requests": total_calls
+            if counts.complete_history
+            else f"{total_calls} recorded; earlier Firecrawl calls unavailable",
+            "Counting": "Logical requests across all resumes; includes failed/reserved calls, excludes SDK retries and cached reuse",
+        }
+        if missing:
+            details["Token coverage"] = (
+                f"{missing} model request(s) have no reported usage; excluded from token totals"
+            )
+        self.event("Run summary", status, details)
 
     def tool_call(self, name: str, arguments: str) -> None:
         try:

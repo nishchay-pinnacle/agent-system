@@ -21,6 +21,7 @@ from research_agent.storage import (
     local_path,
     public_url,
     read_json,
+    record_firecrawl_call,
     save_json,
     source_id,
     write_text,
@@ -204,6 +205,7 @@ class OrientationTools:
                     read_json(self.directory, capture_name)
                 )
             else:
+                record_firecrawl_call(self.directory, "scrape")
                 capture = self.pages.scrape(url)
                 # Original representations persist before cleaning or validation.
                 save_json(self.directory, capture_name, capture.model_dump(mode="json"))
@@ -306,6 +308,7 @@ class OrientationTools:
             if not isinstance(saved_summary, dict):
                 raise ValueError("Invalid saved index")
             return saved_summary
+        record_firecrawl_call(self.directory, "map")
         candidates = self.pages.map(site_url)
         entries: dict[str, Entry] = {}
         rejected = 0

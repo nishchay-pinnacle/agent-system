@@ -94,7 +94,11 @@ Run files contain research content and full debugging transcripts; keep them
 private. `.env`, `.venv`, and `data/` are ignored by Git. Terminal output is centralized in `cli.py`: it shows skill loading, model calls,
 tool parameters, compact results, and safe errors. HTTP request logs are suppressed.
 Each model response shows input/output tokens and cumulative reported usage,
-including saved responses on resume. Cached input and reasoning tokens are subsets,
+including saved responses on resume. A final run summary shows total reported
+tokens and model/Firecrawl request counts, including on failure. Counts include
+failed/reserved logical requests but exclude SDK retries and cached reuse. Older
+runs without Firecrawl counters are labeled as having incomplete call history.
+Cached input and reasoning tokens are subsets,
 not added again. Missing provider usage is marked unavailable; failed requests
 without usage cannot be included. Long profile parameters show a short preview;
 full content remains in the run files. Only one process

@@ -50,9 +50,14 @@ def test_start_and_resume_cli_with_fake_providers(
     assert "discovered_count: 2" in output
     assert "Unavailable from provider" in output
     assert "action=" not in output
+    assert "Run summary · Complete" in output
+    assert "Model requests: 4" in output
+    assert "Firecrawl requests: 2 scrape · 1 map" in output
+    assert "Total API requests: 7" in output
     requests = len(model.requests)
     assert main.main(["resume", "--run-id", directory.name]) == 0
     assert len(model.requests) == requests
+    assert "Total API requests: 7" in capsys.readouterr().out
     assert (
         read_json(directory, "run.json")["settings"]["model"] == "explicit-test-model"
     )
@@ -140,3 +145,51 @@ def test_tool_presentation_is_readable_and_http_logs_are_quiet(
     assert len(output) < 1000
     assert "HTTP Request" not in output
     assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+
+
+def test_summary_keeps_failed_requests_and_usage_across_resume(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_orientation import execute, setup_run
+
+    from research_agent.cli import CLI
+    from research_agent.storage import Run, save_json
+
+    directory, run, model, pages = setup_run(tmp_path)
+    pages.fail_map = True
+    with pytest.raises(RuntimeError, match="map failure"):
+        execute(directory, run, model, pages)
+    # Supply synthetic reported usage; no provider calls are made.
+    for path in (directory / "debug").glob("call-*.response.json"):
+        response = read_json(directory, f"debug/{path.name}")
+        response["usage"] = {"input_tokens": 100, "output_tokens": 20}
+        save_json(directory, f"debug/{path.name}", response)
+    capsys.readouterr()
+    CLI(directory).summary(directory, "Incomplete")
+    output = capsys.readouterr().out
+    assert "Run summary · Incomplete" in output
+    assert "Total tokens (reported): 480" in output
+    assert "Input / output tokens: 400 / 80" in output
+    assert "Total API requests: 7" in output
+    reopened = Run.model_validate(read_json(directory, "run.json"))
+    execute(directory, reopened, FakeModel(run.inputs), FakePages())
+    CLI(directory).summary(directory, "Complete")
+    output = capsys.readouterr().out
+    assert "Total tokens (reported): 480" in output
+    assert "Firecrawl requests: 2 scrape · 2 map" in output
+    assert "Total API requests: 8" in output
+
+
+def test_summary_marks_old_firecrawl_counts_as_unavailable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_orientation import setup_run
+
+    from research_agent.cli import CLI
+    from research_agent.storage import save_run
+
+    directory, run, _, _ = setup_run(tmp_path)
+    save_run(directory, run)
+    (directory / "debug/firecrawl-counts.json").unlink()
+    CLI(directory).summary(directory, "Incomplete")
+    assert "earlier Firecrawl calls unavailable" in capsys.readouterr().out

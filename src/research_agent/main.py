@@ -51,6 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging()
     display = CLI()
     directory: Path | None = None
+    summary_ready = False
     try:
         root = (
             args.data_dir or Path(os.environ.get("RESEARCH_DATA_DIR", "data"))
@@ -89,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
                     {**run.settings.model_dump(), **updates}
                 )
             display = CLI(directory)
+            summary_ready = True
             display.event(
                 "Research",
                 f"{run.inputs.company} · {run.inputs.product}",
@@ -127,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
                     for name in ("profile.md", "sources", "site_index.json")
                 },
             )
+            display.summary(directory, "Complete")
     except (ValueError, RuntimeError, OSError) as exc:
         detail = (
             "Input/configuration validation failed"
@@ -142,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
                     "Resume": f"uv run python -m research_agent.main resume --run-id {directory.name}"
                 },
             )
+            if summary_ready:
+                display.summary(directory, "Incomplete")
         return 1
     return 0
 
