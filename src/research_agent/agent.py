@@ -24,7 +24,7 @@ from research_agent.storage import (
     save_run,
     write_text,
 )
-from research_agent.tools import TOOL_MODELS, OrientationTools
+from research_agent.tools import TOOL_MODELS, OrientationTools, ToolInputError
 
 CREATE_PARAMS = TypeAdapter(ResponseCreateParamsNonStreaming)
 JSON_ITEMS = TypeAdapter(list[dict[str, JsonValue]])
@@ -192,7 +192,13 @@ def run_agent(
         result_name = f"debug/turn-{state['turn']:04d}.tool.json"
         if not local_path(directory, result_name).exists():
             display.tool_call(str(name), str(arguments))
-            result = tools.execute(str(name), str(arguments))
+            try:
+                result = tools.execute(str(name), str(arguments))
+            except ToolInputError as exc:
+                result = {
+                    "error": str(exc),
+                    "action": "Correct the arguments or fulfill the prerequisite, then retry.",
+                }
             display.tool_result(str(name), result)
             save_json(
                 directory,
@@ -227,6 +233,7 @@ def run_agent(
     run.status, run.error = "incomplete", None
     save_run(directory, run)
     try:
+        tools.validate_artifacts()
         checkpoint_path = local_path(directory, "checkpoints.sqlite")
         with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
             compiled = graph.compile(checkpointer=saver)

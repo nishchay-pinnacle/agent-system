@@ -64,8 +64,11 @@ both each full page and the combined prompt/transcript/tool schemas. Exceeding i
 stops visibly without dropping evidence. A provider can still reject its own
 context/output limits. Incomplete model outputs never execute partial tool calls.
 
-Missing/failed sources, index failure, invalid tool calls, exhausted limits and
-provider errors leave the run incomplete. Prompts ask for useful uncertainty;
+Missing/failed sources, index failure, exhausted limits and provider errors leave
+the run incomplete. Correctable tool argument/prerequisite errors are returned as
+tool results so the model can retry within the existing call budget. Reopening
+validates saved source files and recorded hashes, plus index structure; corruption
+pauses for recovery rather than reporting success. Prompts ask for useful uncertainty;
 unknown answers are not execution failures. The runtime validates citation paths
 for both input sources, but does not prove the model's prose is factually correct.
 

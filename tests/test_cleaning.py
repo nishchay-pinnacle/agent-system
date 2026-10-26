@@ -244,3 +244,14 @@ def test_documentation_fixtures_keep_restrictions_and_error_guidance() -> None:
     ):
         assert evidence in controls
     assert "CTRL+K" not in controls
+
+
+def test_doctype_is_not_prose_but_literal_code_survives() -> None:
+    result = clean_html(
+        "<!DOCTYPE html><html><body><h1>Company</h1><p>Product evidence.</p><pre>&lt;!DOCTYPE html&gt;</pre></body></html>",
+        URL,
+        SID,
+    )
+    assert result.content.lstrip().startswith("# Company")
+    assert "Product evidence." in result.content
+    assert "<!DOCTYPE html>" in result.content

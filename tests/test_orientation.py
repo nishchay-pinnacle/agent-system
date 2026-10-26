@@ -384,3 +384,104 @@ def test_sdk_output_with_null_optionals_replays_after_resume(tmp_path: Path) -> 
     assert "namespace" not in replay
     assert replay["call_id"] == "call-0"
     assert read_json(directory, "debug/turn-0000.response.json") == saved
+
+
+@pytest.mark.parametrize("budget", [3, 5, 6])
+def test_rejected_profile_can_be_corrected_after_resume(
+    tmp_path: Path, budget: int
+) -> None:
+    directory, run, _, pages = setup_run(tmp_path, max_model_calls=budget)
+
+    class CorrectingModel(FakeModel):
+        def generate(self, request: dict[str, JsonValue]) -> dict[str, JsonValue]:
+            items = request["input"]
+            assert isinstance(items, list)
+            rejected = [
+                item
+                for item in items
+                if isinstance(item, dict) and item.get("call_id") == "bad-profile"
+            ]
+            if rejected:
+                error = json.loads(rejected[-1]["output"])
+                assert "Profile must reference every starting source" in error["error"]
+                request = {
+                    **request,
+                    "input": [item for item in items if item not in rejected],
+                }
+            response = super().generate(request)
+            call = response["output"][0]
+            if call["name"] == "update_profile" and not rejected:
+                call["call_id"] = "bad-profile"
+                call["arguments"] = '{"content":"Profile without citations"}'
+            return response
+
+    model = CorrectingModel(run.inputs)
+    if budget == 6:
+
+        class LegacyTools(OrientationTools):
+            def update_profile(self, content: str) -> dict[str, JsonValue]:
+                raise ValueError("Legacy citation rejection")
+
+        with pytest.raises(ValueError, match="Legacy citation rejection"):
+            run_agent(
+                directory,
+                run,
+                model,
+                LegacyTools(directory, run.inputs, run.settings, pages),
+            )
+        assert not (directory / "debug/turn-0002.tool.json").exists()
+        run = Run.model_validate(read_json(directory, "run.json"))
+        model, pages = CorrectingModel(run.inputs), FakePages()
+    if budget == 3:
+        with pytest.raises(ValueError, match="limit exhausted"):
+            execute(directory, run, model, pages)
+        assert not (directory / "profile.md").exists()
+        run = Run.model_validate(read_json(directory, "run.json"))
+        run.settings.max_model_calls = 5
+        model, pages = CorrectingModel(run.inputs), FakePages()
+    execute(directory, run, model, pages)
+    assert run.status == "complete" and run.model_calls == 5
+    assert (directory / "profile.md").read_text().count("[Source]") == 2
+    if budget in {3, 6}:
+        assert len(model.requests) == 2 and not pages.scraped
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_source",
+        "changed_source",
+        "changed_capture",
+        "broken_index",
+        "invalid_index",
+    ],
+)
+def test_resume_rejects_damaged_artifacts_without_provider_calls(
+    tmp_path: Path, damage: str
+) -> None:
+    directory, run, model, pages = setup_run(tmp_path)
+    execute(directory, run, model, pages)
+    sid = source_id(run.inputs.company_url)
+    source = directory / f"sources/{sid}.md"
+    if damage == "missing_source":
+        source.unlink()
+    elif damage == "changed_source":
+        source.write_text("Changed evidence")
+    elif damage == "changed_capture":
+        save_json(
+            directory,
+            f"sources/{sid}.capture.json",
+            Capture(markdown="Changed original").model_dump(),
+        )
+    else:
+        (directory / "site_index.json").write_text(
+            "{" if damage == "broken_index" else "{}"
+        )
+    reopened = Run.model_validate(read_json(directory, "run.json"))
+    fresh_model, fresh_pages = FakeModel(run.inputs), FakePages()
+    with pytest.raises(ValueError):
+        execute(directory, reopened, fresh_model, fresh_pages)
+    assert read_json(directory, "run.json")["status"] == "incomplete"
+    assert (
+        not fresh_model.requests and not fresh_pages.scraped and not fresh_pages.mapped
+    )

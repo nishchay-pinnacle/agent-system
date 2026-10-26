@@ -10,7 +10,7 @@ from typing import Protocol
 from bs4 import BeautifulSoup
 from firecrawl import FirecrawlError
 from firecrawl.v2.client import FirecrawlClient
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from requests.exceptions import RequestException
 
 from research_agent.cleaning import clean_markdown, normalize_input, usable
@@ -26,6 +26,10 @@ from research_agent.storage import (
     source_id,
     write_text,
 )
+
+
+class ToolInputError(ValueError):
+    """An argument or prerequisite the model can correct on its next turn."""
 
 
 class Capture(BaseModel):
@@ -176,16 +180,65 @@ class OrientationTools:
         )
 
     def pages_read(self) -> bool:
-        return all(
-            local_path(self.directory, f"sources/{source_id(url)}.json").exists()
-            for url in self.inputs.urls
-        )
+        ready = True
+        for url in self.inputs.urls:
+            sid = source_id(url)
+            metadata_name = f"sources/{sid}.json"
+            if not local_path(self.directory, metadata_name).exists():
+                ready = False
+                continue
+            metadata = read_json(self.directory, metadata_name)
+            reference = f"sources/{sid}.md"
+            evidence = local_path(self.directory, reference)
+            if (
+                metadata.get("reference") != reference
+                or metadata.get("requested_url") != url
+                or not evidence.is_file()
+                or hashlib.sha256(evidence.read_bytes()).hexdigest()
+                != metadata.get("cleaned_sha256")
+            ):
+                raise ValueError(
+                    f"Saved source {sid} is missing or has an invalid hash; restore run files"
+                )
+            capture = Capture.model_validate(
+                read_json(self.directory, f"sources/{sid}.capture.json")
+            )
+            hashes = {
+                kind: hashlib.sha256(getattr(capture, kind).encode()).hexdigest()
+                for kind in ("html", "raw_html", "markdown")
+            }
+            if hashes != metadata.get("raw_hashes"):
+                raise ValueError(
+                    f"Saved capture {sid} has invalid hashes; restore run files"
+                )
+        return ready
+
+    def saved_index(self) -> dict[str, JsonValue]:
+        saved = read_json(self.directory, "site_index.json")
+        entries, summary = saved.get("entries"), saved.get("summary")
+        if (
+            saved.get("site_url") != self.inputs.site_url
+            or not isinstance(entries, list)
+            or not isinstance(summary, dict)
+            or summary.get("discovered_count") != len(entries)
+        ):
+            raise ValueError("Invalid saved index; restore run files")
+        for entry in entries:
+            public_url(Entry.model_validate(entry).url)
+        return summary
+
+    def validate_artifacts(self) -> bool:
+        ready = self.pages_read()
+        if local_path(self.directory, "site_index.json").exists():
+            self.saved_index()
+        return ready
 
     def complete(self) -> bool:
+        ready = self.validate_artifacts()
         profile = local_path(self.directory, "profile.md")
         index = local_path(self.directory, "site_index.json")
         return (
-            self.pages_read()
+            ready
             and profile.exists()
             and bool(profile.read_text().strip())
             and index.exists()
@@ -194,7 +247,9 @@ class OrientationTools:
     def read_page(self, url: str) -> dict[str, JsonValue]:
         url = public_url(url)
         if url not in self.inputs.urls:
-            raise ValueError("Orientation may read only the supplied starting pages")
+            raise ToolInputError(
+                "Orientation may read only the supplied starting pages"
+            )
         sid = source_id(url)
         reference = f"sources/{sid}.md"
         metadata_name = f"sources/{sid}.json"
@@ -274,6 +329,7 @@ class OrientationTools:
                     },
                 },
             )
+        self.pages_read()
         content = local_path(self.directory, reference).read_text(encoding="utf-8")
         if len(content.encode()) + 2048 > self.settings.input_allowance:
             raise ValueError(
@@ -283,12 +339,12 @@ class OrientationTools:
 
     def update_profile(self, content: str) -> dict[str, JsonValue]:
         if not self.pages_read():
-            raise ValueError("Read both starting pages before writing the profile")
+            raise ToolInputError("Read both starting pages before writing the profile")
         if not content.strip():
-            raise ValueError("Profile must contain nonempty Markdown")
+            raise ToolInputError("Profile must contain nonempty Markdown")
         for url in self.inputs.urls:
             if f"sources/{source_id(url)}.md" not in content:
-                raise ValueError(
+                raise ToolInputError(
                     "Profile must reference every starting source using its saved path"
                 )
         write_text(self.directory, "profile.md", content)
@@ -296,18 +352,16 @@ class OrientationTools:
 
     def build_site_index(self, site_url: str) -> dict[str, JsonValue]:
         if public_url(site_url) != self.inputs.site_url:
-            raise ValueError("Map the company site's root URL")
+            raise ToolInputError("Map the company site's root URL")
         if (
             not self.pages_read()
             or not local_path(self.directory, "profile.md").exists()
         ):
-            raise ValueError("Read starting pages and save the profile before mapping")
+            raise ToolInputError(
+                "Read starting pages and save the profile before mapping"
+            )
         if local_path(self.directory, "site_index.json").exists():
-            saved = read_json(self.directory, "site_index.json")
-            saved_summary = saved["summary"]
-            if not isinstance(saved_summary, dict):
-                raise ValueError("Invalid saved index")
-            return saved_summary
+            return self.saved_index()
         record_firecrawl_call(self.directory, "map")
         candidates = self.pages.map(site_url)
         entries: dict[str, Entry] = {}
@@ -345,12 +399,24 @@ class OrientationTools:
 
     def execute(self, name: str, arguments: str) -> dict[str, JsonValue]:
         if name not in TOOL_MODELS:
-            raise ValueError("Unknown orientation tool")
-        args = TOOL_MODELS[name].model_validate_json(arguments)
+            raise ToolInputError("Unknown orientation tool")
+        try:
+            args = TOOL_MODELS[name].model_validate_json(arguments)
+            if isinstance(args, ReadArgs):
+                args.url = public_url(args.url)
+            elif isinstance(args, IndexArgs):
+                args.site_url = public_url(args.site_url)
+        except ValidationError as exc:
+            errors = "; ".join(
+                error["msg"] for error in exc.errors(include_input=False)
+            )
+            raise ToolInputError(f"Invalid {name} arguments: {errors}") from exc
+        except ValueError as exc:
+            raise ToolInputError(str(exc)) from exc
         if isinstance(args, ReadArgs):
             return self.read_page(args.url)
         if isinstance(args, ProfileArgs):
             return self.update_profile(args.content)
         if isinstance(args, IndexArgs):
             return self.build_site_index(args.site_url)
-        raise ValueError("Unsupported tool arguments")
+        raise ToolInputError("Unsupported tool arguments")

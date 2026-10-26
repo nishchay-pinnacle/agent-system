@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from html import escape
 from urllib.parse import parse_qs, urljoin, urlsplit
 
-from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+from bs4 import BeautifulSoup, Comment, Doctype, NavigableString, Tag
 from bs4.exceptions import ParserRejectedMarkup
 from markdownify import markdownify
 from pydantic import JsonValue
@@ -162,6 +162,8 @@ def clean_html(raw: str, page_url: str, source_id: str) -> HTMLResult:
         soup = BeautifulSoup(raw, "html.parser")
     except ParserRejectedMarkup as exc:
         raise ConversionError("HTML parser rejected capture") from exc
+    for declaration in soup.find_all(string=lambda node: isinstance(node, Doctype)):
+        declaration.extract()
     tags = list(soup.find_all(True))
     locators = {id(tag): f"{tag.name}:node({i})" for i, tag in enumerate(tags, 1)}
 
