@@ -8,7 +8,10 @@ Retrieve an original file with `git show <original-sha>:<path>`.
 
 ## Reading the implementation
 
-1. `main.py` validates CLI/environment settings and starts/resumes one run.
+1. `main.py` validates environment settings and starts/resumes one run.
+   `cli.py` owns argument parsing and all terminal presentation: model calls and
+   reported token totals, tool arguments/results, skills, completion and errors.
+   Usage totals are reconstructed from existing response records, not new state.
 2. `agent.py` loads the system prompt, user template, and orientation skill;
    snapshots them; and builds a two-node LangGraph loop: model → tool → model/end.
    These nodes belong to one agent. There is no separate orientation agent.

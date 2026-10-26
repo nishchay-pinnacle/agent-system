@@ -91,8 +91,13 @@ Each run lives under `data/runs/<run_id>/`:
 - `system.md`, `user.json`: runtime-loaded prompt and skill snapshots for resume.
 
 Run files contain research content and full debugging transcripts; keep them
-private. `.env`, `.venv`, and `data/` are ignored by Git. Terminal progress reports
-run IDs, actions and safe errors, not page bodies or credentials. Only one process
+private. `.env`, `.venv`, and `data/` are ignored by Git. Terminal output is centralized in `cli.py`: it shows skill loading, model calls,
+tool parameters, compact results, and safe errors. HTTP request logs are suppressed.
+Each model response shows input/output tokens and cumulative reported usage,
+including saved responses on resume. Cached input and reasoning tokens are subsets,
+not added again. Missing provider usage is marked unavailable; failed requests
+without usage cannot be included. Long profile parameters show a short preview;
+full content remains in the run files. Only one process
 may operate on a run at a time (local Unix file lock).
 
 ## Offline verification

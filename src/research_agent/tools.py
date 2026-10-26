@@ -1,7 +1,6 @@
 """The three orientation tools and the Firecrawl boundary."""
 
 import hashlib
-import logging
 import re
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -26,8 +25,6 @@ from research_agent.storage import (
     source_id,
     write_text,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class Capture(BaseModel):
@@ -344,7 +341,6 @@ class OrientationTools:
         return summary
 
     def execute(self, name: str, arguments: str) -> dict[str, JsonValue]:
-        logger.info("run=%s action=%s", self.directory.name, name)
         if name not in TOOL_MODELS:
             raise ValueError("Unknown orientation tool")
         args = TOOL_MODELS[name].model_validate_json(arguments)

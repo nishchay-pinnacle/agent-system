@@ -1,7 +1,5 @@
 """Start or resume one orientation run: python -m research_agent.main --help."""
 
-import argparse
-import logging
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -10,6 +8,7 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from research_agent.agent import OpenAIModel, initialize_prompts, run_agent
+from research_agent.cli import CLI, configure_logging, parser
 from research_agent.storage import (
     Inputs,
     Run,
@@ -46,37 +45,11 @@ def environment_settings() -> Settings:
     )
 
 
-def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description=__doc__)
-    actions = result.add_subparsers(dest="action", required=True)
-    start = actions.add_parser("start", help="Create a new orientation run")
-    for name in ("company", "product", "company-url", "product-url"):
-        start.add_argument(f"--{name}", required=True)
-    start.add_argument("--instructions", default="")
-    resume = actions.add_parser("resume", help="Resume a new-format run")
-    resume.add_argument("--run-id", required=True)
-    resume.add_argument(
-        "--max-model-calls", type=int, help="Explicit new total model-call allowance"
-    )
-    resume.add_argument(
-        "--input-allowance", type=int, help="Explicit new conservative input allowance"
-    )
-    for command in (start, resume):
-        command.add_argument(
-            "--data-dir",
-            type=Path,
-            default=None,
-            help="Data root (default RESEARCH_DATA_DIR or ./data)",
-        )
-    return result
-
-
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     load_dotenv(Path.cwd() / ".env", override=False)
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    # SDK HTTP logs can contain request URLs; only application progress reaches terminal.
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    configure_logging()
+    display = CLI()
     directory: Path | None = None
     try:
         root = (
@@ -115,9 +88,15 @@ def main(argv: list[str] | None = None) -> int:
                 run.settings = Settings.model_validate(
                     {**run.settings.model_dump(), **updates}
                 )
-            print(
-                f"Run: {run.run_id}\nModel: {run.settings.model}\nOutputs: {directory.resolve()}",
-                flush=True,
+            display = CLI(directory)
+            display.event(
+                "Research",
+                f"{run.inputs.company} · {run.inputs.product}",
+                {"Model": run.settings.model},
+            )
+            display.skill(
+                "orientation",
+                "Using saved instructions" if args.action == "resume" else "Loaded",
             )
             openai_key, firecrawl_key = (
                 os.environ.get("OPENAI_API_KEY", ""),
@@ -138,19 +117,31 @@ def main(argv: list[str] | None = None) -> int:
                 run,
                 OpenAIModel(openai_key, run.settings.timeout_seconds),
                 tools,
+                display,
             )
-            print("Orientation complete. No additional pages explored.")
-            for name in ("profile.md", "sources", "site_index.json"):
-                print(directory.resolve() / name)
+            display.event(
+                "Complete",
+                "Orientation complete",
+                {
+                    name: str(directory.resolve() / name)
+                    for name in ("profile.md", "sources", "site_index.json")
+                },
+            )
     except (ValueError, RuntimeError, OSError) as exc:
         detail = (
             "Input/configuration validation failed"
             if isinstance(exc, ValidationError)
             else str(exc)
         )
-        print(f"Orientation incomplete: {type(exc).__name__}: {detail}")
+        display.event("Error", f"Orientation incomplete: {detail}")
         if directory is not None:
-            print(f"Preserved work: {directory.resolve()}")
+            display.event(
+                "Saved work",
+                str(directory.resolve()),
+                {
+                    "Resume": f"uv run python -m research_agent.main resume --run-id {directory.name}"
+                },
+            )
         return 1
     return 0
 

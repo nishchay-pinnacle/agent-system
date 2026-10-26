@@ -1,7 +1,6 @@
 """One tool-calling agent; LangGraph checkpoints contain only transcript references."""
 
 import json
-import logging
 from importlib.resources import files
 from pathlib import Path
 from typing import Protocol, TypedDict
@@ -15,6 +14,7 @@ from openai.types.responses.response_create_params import (
 )
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
+from research_agent.cli import CLI
 from research_agent.storage import (
     Run,
     local_path,
@@ -25,7 +25,6 @@ from research_agent.storage import (
 )
 from research_agent.tools import TOOL_MODELS, OrientationTools
 
-logger = logging.getLogger(__name__)
 CREATE_PARAMS = TypeAdapter(ResponseCreateParamsNonStreaming)
 JSON_ITEMS = TypeAdapter(list[dict[str, JsonValue]])
 
@@ -94,7 +93,15 @@ def definitions() -> list[dict[str, JsonValue]]:
     ]
 
 
-def run_agent(directory: Path, run: Run, model: Model, tools: OrientationTools) -> None:
+def run_agent(
+    directory: Path,
+    run: Run,
+    model: Model,
+    tools: OrientationTools,
+    display: CLI | None = None,
+) -> None:
+    display = display or CLI(directory)
+
     def model_node(state: State) -> State:
         turn = state["turn"]
         response_name = f"debug/turn-{turn:04d}.response.json"
@@ -143,16 +150,12 @@ def run_agent(directory: Path, run: Run, model: Model, tools: OrientationTools) 
                 directory, f"debug/call-{run.model_calls:04d}.request.json", request
             )
             save_run(directory, run)
-            logger.info(
-                "run=%s action=model call=%s model=%s",
-                run.run_id,
-                run.model_calls,
-                run.settings.model,
-            )
+            display.model_call(run.model_calls, run.settings.model)
             response = model.generate(request)
             save_json(
                 directory, f"debug/call-{run.model_calls:04d}.response.json", response
             )
+            display.model_result(response.get("usage"))
             if response.get("status") != "completed":
                 raise ValueError(
                     "Model response incomplete; response retained, resume retries within the call limit"
@@ -164,6 +167,8 @@ def run_agent(directory: Path, run: Run, model: Model, tools: OrientationTools) 
                     "Expected exactly one orientation tool call; response retained"
                 )
             save_json(directory, response_name, {"items": output})
+        else:
+            display.event("Model", "Reusing saved response")
         return {"history": state["history"] + [response_name], "turn": turn}
 
     def tool_node(state: State) -> State:
@@ -180,7 +185,9 @@ def run_agent(directory: Path, run: Run, model: Model, tools: OrientationTools) 
             raise ValueError("Malformed function call")
         result_name = f"debug/turn-{state['turn']:04d}.tool.json"
         if not local_path(directory, result_name).exists():
+            display.tool_call(str(name), str(arguments))
             result = tools.execute(str(name), str(arguments))
+            display.tool_result(str(name), result)
             save_json(
                 directory,
                 result_name,
@@ -194,6 +201,8 @@ def run_agent(directory: Path, run: Run, model: Model, tools: OrientationTools) 
                     ]
                 },
             )
+        else:
+            display.event("Tool", str(name), {"Status": "Reusing saved result"})
         return {"history": state["history"] + [result_name], "turn": state["turn"] + 1}
 
     def route(state: State) -> str:
@@ -242,9 +251,6 @@ def run_agent(directory: Path, run: Run, model: Model, tools: OrientationTools) 
             {"error": run.error, "type": type(exc).__name__},
         )
         save_run(directory, run)
-        logger.error(
-            "run=%s action=stopped status=incomplete error=%s", run.run_id, run.error
-        )
         raise
     run.status = "complete"
     save_run(directory, run)
