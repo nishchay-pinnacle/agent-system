@@ -1,7 +1,7 @@
 [project]
-name = "agent-system"
+name = "research-agent"
 version = "0.1.0"
-description = "Local company intelligence research with persistent checkpoints"
+description = "Orientation-only company research with local checkpoints"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
@@ -14,7 +14,6 @@ dependencies = [
     "openai>=3.37.0",
     "pydantic>=2.14.1",
     "python-dotenv",
-    "tiktoken>=0.14.0",
 ]
 
 [dependency-groups]
@@ -25,7 +24,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agent_system"]
+packages = ["src/research_agent"]
 
 [tool.ruff]
 target-version = "py313"
@@ -36,7 +35,7 @@ select = ["E4", "E7", "E9", "F", "I"]
 
 [tool.mypy]
 python_version = "3.13"
-files = ["src/agent_system"]
+files = ["src/research_agent"]
 disallow_untyped_defs = true
 check_untyped_defs = true
 warn_unused_ignores = true
@@ -46,7 +45,7 @@ no_implicit_optional = true
 testpaths = ["tests"]
 
 # Firecrawl 4.54.0 ships annotations without a py.typed marker. Only this SDK
-# is exempt from import analysis; its responses are validated at agent.py.
+# is exempt from import analysis; its responses are validated at tools.py.
 [[tool.mypy.overrides]]
 module = ["firecrawl", "firecrawl.*"]
 ignore_missing_imports = true

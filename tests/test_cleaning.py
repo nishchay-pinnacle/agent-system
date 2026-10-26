@@ -1,28 +1,11 @@
-"""Synthetic structural preservation, capture and compatibility regressions."""
-
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
-import pytest
-from research_script import SID, URL, ScriptedProviders
-from test_orientation import new_state
+from research_agent.cleaning import clean_markdown
+from research_agent.html_cleaning import clean_html
 
-from agent_system.company_intelligence import agent, html_cleaning, page_content
-from agent_system.company_intelligence.agent import FetchResult, LiveProviders
-from agent_system.company_intelligence.artifacts import read_json
-from agent_system.company_intelligence.html_cleaning import ConversionError, clean_html
-from agent_system.company_intelligence.page_content import (
-    clean_markdown,
-    clean_markdown_v1,
-    cleaned_path,
-    digest,
-    load_cleaned,
-)
-from agent_system.company_intelligence.schemas import Source
-from agent_system.company_intelligence.site_index import search_inventory
-from agent_system.company_intelligence.tools import excerpt
-from agent_system.company_intelligence.workflow import run_research
+URL = "https://example.com/"
+SID = "s_test"
 
 MARKETING = """<html><head><script type="application/ld+json">{"@type":"Organization","name":"Widget"}</script><script>hydration secret</script></head><body>
 <header><nav aria-label="Global"><a href="/docs?edition=pro#limits">Documentation</a><a href="/suite"><p>Manage keys across clouds.</p></a></nav><a href="/login">Log in</a></header>
@@ -172,178 +155,6 @@ def test_markdown_unicode_structure_and_idempotence() -> None:
     assert cleaned == clean_markdown(cleaned)
 
 
-def saved_source(
-    directory: Path, markdown: str, html: str | None = None, raw_html: str | None = None
-) -> Source:
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "sources").mkdir(exist_ok=True)
-    source = Source(
-        source_id=SID,
-        requested_url=URL,
-        filename=f"sources/{SID}.md",
-        cleaner_version="4",
-        outcome="success",
-    )
-    (directory / source.filename).write_bytes(markdown.encode())
-    for field, text, suffix in (
-        ("html_filename", html, ".html"),
-        ("raw_html_filename", raw_html, ".raw.html"),
-    ):
-        if text is not None:
-            filename = f"sources/{SID}{suffix}"
-            (directory / filename).write_bytes(text.encode())
-            setattr(source, field, filename)
-    return source
-
-
-def test_selection_reports_conversion_failure_and_legacy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = saved_source(
-        tmp_path / "new",
-        "# Fallback\nUseful fact.",
-        '<div id="app"><script>hydrate()</script></div>',
-        "<h1>Raw content</h1><p>One\x00two.</p>",
-    )
-    text = load_cleaned(tmp_path / "new", source)
-    assert "Raw content" in text and "One\ufffdtwo" in text
-    report = read_json(tmp_path / "new" / source.cleaning_report_filename)
-    assert (
-        report["selected_representation"] == "raw_html"
-        and len(report["raw_hashes"]) == 3
-    )
-    assert report["nul_replacements"] == 1 and report["cleaned_hash"] == digest(text)
-    duplicate = saved_source(
-        tmp_path / "same",
-        "# Fallback\nUseful fact.",
-        '<div id="app"><script>hydrate()</script></div>',
-        "<h1>Raw content</h1><p>One\x00two.</p>",
-    )
-    assert load_cleaned(tmp_path / "same", duplicate) == text
-    assert (tmp_path / "same" / duplicate.cleaning_report_filename).read_bytes() == (
-        tmp_path / "new" / source.cleaning_report_filename
-    ).read_bytes()
-
-    def fail(*args: object) -> object:
-        raise ConversionError("synthetic converter failure")
-
-    monkeypatch.setattr(page_content, "clean_html", fail)
-    fallback = saved_source(tmp_path / "fallback", "Fallback evidence", "<p>HTML</p>")
-    assert load_cleaned(tmp_path / "fallback", fallback) == "Fallback evidence"
-    assert "synthetic converter failure" in json.dumps(fallback.cleaning_summary)
-    unusable = saved_source(tmp_path / "empty", "Loading...")
-    with pytest.raises(ValueError, match="empty/loading/error"):
-        load_cleaned(tmp_path / "empty", unusable)
-    legacy_dir = tmp_path / "legacy"
-    raw = "Old\x00text\n<!-- comment -->\n    <script>old behavior</script>"
-    legacy = saved_source(legacy_dir, raw)
-    legacy.cleaner_version = "1"
-    legacy.cleaned_filename = f"sources/{SID}.cleaned.md"
-    expected = clean_markdown_v1(raw)
-    assert load_cleaned(legacy_dir, legacy) == expected
-    historical = "Bytes actually seen by the old model\r\n"
-    (legacy_dir / legacy.cleaned_filename).write_bytes(historical.encode())
-    reopened = Source.model_validate_json(legacy.model_dump_json())
-    assert load_cleaned(legacy_dir, reopened) == historical
-    assert excerpt(legacy_dir, reopened)["cleaner_version"] == "1"
-    assert (legacy_dir / legacy.filename).read_bytes() == raw.encode()
-    reopened.cleaned_filename = "sources/../../secret"
-    with pytest.raises(ValueError):
-        cleaned_path(legacy_dir, reopened)
-    reopened.cleaned_filename = f"sources/{SID}.cleaned.v4.md"
-    (legacy_dir / reopened.cleaned_filename).symlink_to(tmp_path / "outside")
-    with pytest.raises(ValueError):
-        cleaned_path(legacy_dir, reopened)
-
-
-def test_all_formats_one_sdk_call_shared_delivery(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls: list[dict[str, object]] = []
-
-    class FakeFirecrawl:
-        def __init__(self, **kwargs: object) -> None:
-            pass
-
-        def scrape(self, url: str, **kwargs: object) -> SimpleNamespace:
-            calls.append(kwargs)
-            return SimpleNamespace(
-                markdown="Unmodified fallback\r\n",
-                html=MARKETING,
-                raw_html="<p>Raw capture</p>",
-                metadata=None,
-            )
-
-    monkeypatch.setattr(agent, "FirecrawlClient", FakeFirecrawl)
-    monkeypatch.setattr(agent, "public_url", lambda url, **kwargs: url)
-    monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-offline")
-    monkeypatch.setenv("OPENAI_API_KEY", "fake-offline")
-    fetched = LiveProviders(tmp_path, "fake").retrieve("scrape_page", {"url": URL}, 90)
-    assert len(calls) == 1 and calls[0]["formats"] == ["markdown", "html", "rawHtml"]
-    assert calls[0]["only_main_content"] is False
-
-    class Captures(ScriptedProviders):
-        def retrieve(
-            self, name: str, args: dict[str, object], timeout: float
-        ) -> FetchResult:
-            return fetched if name == "scrape_page" else FetchResult(candidates=[])
-
-    initial = new_state()
-    done = run_research(tmp_path, initial.job_id, initial, Captures(tmp_path))
-    assert done.status == "completed"
-    directory = tmp_path / "jobs" / done.job_id
-    source = done.sources[SID]
-    assert (directory / source.filename).read_bytes() == fetched.markdown.encode()
-    assert (directory / source.html_filename).read_text() == MARKETING
-    assert (directory / source.raw_html_filename).read_text() == fetched.raw_html
-    delivery = excerpt(directory, source)
-    full = read_json(directory / "orientation_context.json")
-    page = json.loads(full["messages"][0]["content"])["pages"][0]
-    assert (
-        page["content_hash"]
-        == delivery["content_hash"]
-        == digest(load_cleaned(directory, source))
-    )
-    assert page["cleaner_version"] == delivery["cleaner_version"] == "4"
-    assert page["cleaning_summary"] == delivery["cleaning_summary"]
-    assert search_inventory(directory, "documentation")["entries"]
-    before = {str(p): p.read_bytes() for p in directory.rglob("*") if p.is_file()}
-    run_research(tmp_path, initial.job_id, providers=Captures(tmp_path))
-    for path, content in before.items():
-        assert Path(path).read_bytes() == content
-
-
-def test_protected_block_loss_falls_back_without_hiding_programming_errors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = saved_source(
-        tmp_path / "guard",
-        "Saved fallback evidence",
-        "<pre>  code\n</pre><table><tr><td rowspan=2>Limit</td></tr></table>",
-    )
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            html_cleaning,
-            "render_markdown",
-            lambda text: "converter lost protected content",
-        )
-        assert load_cleaned(tmp_path / "guard", source) == "Saved fallback evidence"
-    assert "protected block" in json.dumps(source.cleaning_summary)
-    reopened = Source.model_validate_json(source.model_dump_json())
-    reopened.cleaning_summary = {}
-    reopened.cleaning_report_filename = None
-    assert load_cleaned(tmp_path / "guard", reopened) == "Saved fallback evidence"
-    assert reopened.cleaning_summary == source.cleaning_summary
-
-    def programming_error(*args: object) -> object:
-        raise RuntimeError("unexpected programming error")
-
-    monkeypatch.setattr(page_content, "clean_html", programming_error)
-    broken = saved_source(tmp_path / "broken", "Fallback", "<p>HTML</p>")
-    with pytest.raises(RuntimeError, match="unexpected programming error"):
-        load_cleaned(tmp_path / "broken", broken)
-
-
 def test_uncertain_components_code_and_variant_context_survive() -> None:
     raw = """<div class="cookie-banner"><p>A cookie product capability with no consent controls.</p></div>
     <pre><code><script>literal()</script><!-- literal --></code></pre>
@@ -409,16 +220,27 @@ def test_nested_launch_footer_and_icon_regression(tmp_path: Path) -> None:
     assert result == clean_html(raw, URL, SID)
 
 
-def test_v2_bytes_stay_historical_and_v3_paths_are_distinct(tmp_path: Path) -> None:
-    source = saved_source(tmp_path, "Original fallback", "<p>New capture</p>")
-    source.cleaner_version = "2"
-    source.cleaned_filename = f"sources/{SID}.cleaned.v2.md"
-    historical = "ASK AI ABOUT LEGACY: actual bytes the model saw\r\n"
-    (tmp_path / source.cleaned_filename).write_bytes(historical.encode())
-    reopened = Source.model_validate_json(source.model_dump_json())
-    assert load_cleaned(tmp_path, reopened) == historical
-    assert reopened.cleaner_version == "2"
-    (tmp_path / source.cleaned_filename).unlink()
-    with pytest.raises(ValueError, match="historical v2"):
-        load_cleaned(tmp_path, reopened)
-    assert not (tmp_path / source.cleaned_filename).exists()
+def test_documentation_fixtures_keep_restrictions_and_error_guidance() -> None:
+    fixtures = Path(__file__).parent / "fixtures"
+    category = clean_html(
+        (fixtures / "documentation_category.html").read_text(), URL, SID
+    ).content
+    for evidence in (
+        "404 errors and how to recover",
+        "Linux prerequisites",
+        "Azure VM",
+        "Enterprise only, subject to regional restrictions",
+    ):
+        assert evidence in category
+    controls = clean_html(
+        (fixtures / "documentation_controls.html").read_text(), URL, SID
+    ).content
+    for evidence in (
+        "Intel TDX",
+        "AMD SEV-SNP",
+        "Platform measurements must match",
+        "Attestation required",
+        "Search is a product capability",
+    ):
+        assert evidence in controls
+    assert "CTRL+K" not in controls

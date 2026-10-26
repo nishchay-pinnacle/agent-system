@@ -226,8 +226,8 @@ def clean_html(raw: str, page_url: str, source_id: str) -> HTMLResult:
     base_url = page_url
     base = soup.find("base", href=True)
     if base:
-        # Local import avoids the tools -> page_content -> cleaner dependency cycle.
-        from agent_system.company_intelligence.tools import public_url
+        # Validate captured base URLs before resolving links.
+        from research_agent.storage import public_url
 
         try:
             candidate_base = urljoin(page_url, attr(base, "href"))

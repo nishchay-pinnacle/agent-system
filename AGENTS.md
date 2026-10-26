@@ -2,11 +2,10 @@
 
 ## Project boundaries
 
-Pinnacle is a local Python research application: one worker, a defined LangGraph
-workflow, Deep Agents where needed, SQLite checkpoints, and local research files.
-This describes the intended architecture, not proof that it is implemented.
-Build only the requested slice. Do not add queues, services, generic frameworks,
-or future system placeholders unless the task needs them.
+This project is one local orientation-only research agent, three tools, LangGraph
+SQLite checkpoints, and run-local files. Orientation is a runtime-loaded skill of
+the same agent. Do not add deeper investigations, subagents, dashboards, approval
+flows, queues, services, or custom context compaction without a new request.
 
 ## Working approach
 
@@ -43,8 +42,7 @@ or future system placeholders unless the task needs them.
 
 ## Workflow, persistence, and failures
 
-- Keep the worker thin: it starts/resumes jobs. The workflow routes between
-  stages; system modules implement the work. Reuse LangGraph's persistence.
+- Keep the CLI thin and tool implementations explicit. Reuse LangGraph persistence.
 - Keep checkpoint state small and serializable. Store large research outputs
   separately and reference them by stable IDs or paths. Reuse the same thread
   ID when resuming the same job; isolate different jobs' state and outputs.
@@ -85,7 +83,7 @@ After the project tools are configured, the baseline commands are:
 ```bash
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy src/agent_system
+uv run mypy src/research_agent
 uv run pytest
 ```
 
