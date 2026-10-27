@@ -92,6 +92,7 @@ class Settings(BaseModel):
     output_tokens: int = Field(default=8000, ge=256)
     timeout_seconds: float = Field(default=120, gt=0, le=3600)
     map_limit: int = Field(default=5000, ge=1, le=100000)
+    index_result_limit: int = Field(default=20, ge=1, le=50)
 
 
 class Run(BaseModel):
@@ -102,6 +103,9 @@ class Run(BaseModel):
     status: str = "incomplete"
     model_calls: int = 0
     error: str | None = None
+    stage: Literal["orientation", "research"] = "orientation"
+    research_page_budget: int = Field(default=0, ge=0, le=10000)
+    research_page_attempts: int = Field(default=0, ge=0)
 
 
 def run_directory(root: Path, run_id: str) -> Path:
@@ -242,3 +246,67 @@ def save_orientation_snapshot(directory: Path, inputs: Inputs) -> str:
         save_json(directory, ORIENTATION_SNAPSHOT, snapshot.model_dump())
     load_orientation_snapshot(directory, ORIENTATION_SNAPSHOT, inputs)
     return ORIENTATION_SNAPSHOT
+
+
+RESEARCH_START = "research/start.json"
+RESEARCH_RECEIPT = (
+    "Orientation is complete and research is now active. The starting pages, initial "
+    "profile and company site index are saved. Investigate material gaps using the "
+    "saved index and linked HTML evidence, update the profile, then explicitly "
+    "finish_research when further public research is unlikely to materially help."
+)
+
+
+class ResearchStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: Literal[1] = 1
+    original_run: Run
+    system: str = Field(min_length=1)
+    user: str = Field(min_length=1)
+    profile: str = Field(min_length=1)
+    sources: list[str]
+    receipt: str = RESEARCH_RECEIPT
+    model_calls: int = Field(ge=1, le=1000)
+    page_budget: int = Field(ge=1, le=10000)
+    input_allowance: int = Field(ge=1000)
+    index_result_limit: int = Field(default=20, ge=1, le=50)
+
+
+def load_research_start(directory: Path, run: Run) -> ResearchStart:
+    saved = read_json(directory, RESEARCH_START)
+    if saved.get("version") != 1:
+        raise ValueError("Unsupported research context version; preserve run files")
+    start = ResearchStart.model_validate(saved)
+    if (
+        start.original_run.run_id != run.run_id
+        or start.original_run.inputs != run.inputs
+        or start.original_run.stage != "orientation"
+        or start.original_run.status != "complete"
+        or start.receipt != RESEARCH_RECEIPT
+    ):
+        raise ValueError("Research context does not match this completed orientation")
+    return start
+
+
+def activate_research(directory: Path, run: Run) -> ResearchStart:
+    start = load_research_start(directory, run)
+    if run.stage == "orientation":
+        if (
+            run.status != "complete"
+            or run.model_calls != start.original_run.model_calls
+        ):
+            raise ValueError(
+                "Cannot activate research from changed/incomplete orientation"
+            )
+        run.settings = Settings.model_validate(
+            {
+                **start.original_run.settings.model_dump(),
+                "max_model_calls": start.original_run.model_calls + start.model_calls,
+                "input_allowance": start.input_allowance,
+                "index_result_limit": start.index_result_limit,
+            }
+        )
+        run.stage, run.status, run.error = "research", "incomplete", None
+        run.research_page_budget = start.page_budget
+        save_run(directory, run)
+    return start

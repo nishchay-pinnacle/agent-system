@@ -12,14 +12,18 @@ from openai import APIConnectionError, APIStatusError, OpenAI
 from openai.types.responses.response_create_params import (
     ResponseCreateParamsNonStreaming,
 )
-from pydantic import JsonValue, TypeAdapter, ValidationError
+from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 
 from research_agent.cli import CLI
 from research_agent.storage import (
     JSON_OBJECT,
+    RESEARCH_START,
     FirecrawlCounts,
+    ResearchStart,
     Run,
+    activate_research,
     load_orientation_snapshot,
+    load_research_start,
     local_path,
     read_json,
     save_json,
@@ -27,7 +31,7 @@ from research_agent.storage import (
     save_run,
     write_text,
 )
-from research_agent.tools import TOOL_MODELS, OrientationTools, ToolInputError
+from research_agent.tools import OrientationTools, ToolInputError, tool_models
 
 CREATE_PARAMS = TypeAdapter(ResponseCreateParamsNonStreaming)
 JSON_ITEMS = TypeAdapter(list[dict[str, JsonValue]])
@@ -86,20 +90,91 @@ def initialize_prompts(directory: Path, run: Run) -> None:
     save_json(directory, "user.json", {"items": [{"role": "user", "content": user}]})
 
 
-def definitions() -> list[dict[str, JsonValue]]:
+def tool_schema(model: type[BaseModel]) -> dict[str, JsonValue]:
+    schema = JSON_OBJECT.validate_python(model.model_json_schema())
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        schema["required"] = list(properties)
+        for value in properties.values():
+            if isinstance(value, dict):
+                value.pop("default", None)
+    return schema
+
+
+def begin_research(
+    directory: Path,
+    run: Run,
+    tools: OrientationTools,
+    *,
+    model_calls: int,
+    page_budget: int,
+    input_allowance: int,
+    index_result_limit: int = 20,
+) -> None:
+    if run.stage != "orientation" or run.status != "complete":
+        raise ValueError(
+            "Research requires a completed orientation; use resume for an existing research stage"
+        )
+    if not tools.complete():
+        raise ValueError(
+            "Orientation artifacts are incomplete; restore them before research"
+        )
+    if not local_path(directory, RESEARCH_START).exists():
+        package = files("research_agent")
+        start = ResearchStart(
+            original_run=run.model_copy(deep=True),
+            system=package.joinpath("prompts/system.md").read_text()
+            + "\n\n"
+            + package.joinpath("skills/research/SKILL.md").read_text(),
+            user=package.joinpath("prompts/user.md")
+            .read_text()
+            .format(**run.inputs.model_dump())
+            + "\nContinue this task into research now. Orientation is complete.",
+            profile=local_path(directory, "profile.md").read_bytes().decode("utf-8"),
+            sources=tools.saved_sources(),
+            model_calls=model_calls,
+            page_budget=page_budget,
+            input_allowance=input_allowance,
+            index_result_limit=index_result_limit,
+        )
+        # Validate the cumulative limit before persisting the transition intent.
+        run.settings.model_validate(
+            {
+                **run.settings.model_dump(),
+                "max_model_calls": run.model_calls + model_calls,
+            }
+        )
+        save_json(directory, RESEARCH_START, start.model_dump(mode="json"))
+    else:
+        start = load_research_start(directory, run)
+        if (
+            start.model_calls,
+            start.page_budget,
+            start.input_allowance,
+            start.index_result_limit,
+        ) != (model_calls, page_budget, input_allowance, index_result_limit):
+            raise ValueError(
+                "Research transition already prepared with different allowances; use resume"
+            )
+    activate_research(directory, run)
+
+
+def definitions(stage: str = "orientation") -> list[dict[str, JsonValue]]:
     return [
         {
             "type": "function",
             "name": name,
             "description": {
-                "read_page": "Read a supplied starting URL; returns full cleaned evidence and its saved source reference.",
-                "update_profile": "Save flexible Markdown with source references after reading both starting pages.",
+                "read_page": "Read a permitted HTML page; returns full cleaned evidence and its saved source reference.",
+                "update_profile": "Replace the full Markdown profile with saved-source citations and remaining uncertainties.",
                 "build_site_index": "Map the company root broadly after saving the profile; returns counts and limitations, then orientation stops.",
+                "query_site_index": "Search saved URLs, titles and descriptions case-insensitively. All whitespace-separated terms must occur; double quotes group an exact substring phrase. Empty query matches all. Optional path_filter is a case-insensitive substring of the decoded URL path. Results sort by URL. offset is zero-based; limit null uses the configured default, otherwise 1-50. Returns total/returned counts, next_offset and already_saved; never fetches pages.",
+                "finish_research": "Save a short completion reason and stop. Findings and unresolved interview questions must already be in profile.md.",
             }[name],
             "strict": True,
-            "parameters": schema.model_json_schema(),
+            "parameters": tool_schema(schema),
         }
-        for name, schema in TOOL_MODELS.items()
+        for name, schema in tool_models(stage).items()
     ]
 
 
@@ -111,13 +186,30 @@ def run_agent(
     display: CLI | None = None,
 ) -> None:
     display = display or CLI(directory)
+    research = None
+    if run.stage == "research" or local_path(directory, RESEARCH_START).exists():
+        research = activate_research(directory, run)
+    tools.run, tools.settings = run, run.settings
+    prefix = "research-" if run.stage == "research" else ""
 
     def model_node(state: State) -> State:
         turn = state["turn"]
-        response_name = f"debug/turn-{turn:04d}.response.json"
-        request_name = f"debug/turn-{turn:04d}.request.json"
+        response_name = f"debug/{prefix}turn-{turn:04d}.response.json"
+        request_name = f"debug/{prefix}turn-{turn:04d}.request.json"
         if not local_path(directory, response_name).exists():
             items: list[dict[str, JsonValue]] = []
+            if research is not None:
+                items = [
+                    {"role": "user", "content": research.user},
+                    {
+                        "role": "assistant",
+                        "content": research.receipt
+                        + "\n\nSaved sources:\n"
+                        + "\n".join(research.sources)
+                        + "\n\nCurrent profile at research start:\n"
+                        + research.profile,
+                    },
+                ]
             if baseline := state.get("baseline"):
                 snapshot = load_orientation_snapshot(directory, baseline, run.inputs)
                 items.extend(
@@ -148,9 +240,11 @@ def run_agent(
                 )
             request: dict[str, JsonValue] = {
                 "model": run.settings.model,
-                "instructions": local_path(directory, "system.md").read_text(),
+                "instructions": research.system
+                if research is not None
+                else local_path(directory, "system.md").read_text(),
                 "input": list(items),
-                "tools": list(definitions()),
+                "tools": list(definitions(run.stage)),
                 "tool_choice": "required",
                 "parallel_tool_calls": False,
                 "store": False,
@@ -169,7 +263,7 @@ def run_agent(
                 )
             if run.model_calls >= run.settings.max_model_calls:
                 raise ValueError(
-                    "Model-call limit exhausted; orientation incomplete. Resume with a higher --max-model-calls to continue explicitly."
+                    f"Model-call limit exhausted; {run.stage} incomplete. Resume with a higher --max-model-calls to continue explicitly."
                 )
             save_json(directory, request_name, request)
             run.model_calls += 1
@@ -191,7 +285,7 @@ def run_agent(
             calls = [item for item in output if item.get("type") == "function_call"]
             if len(calls) != 1:
                 raise ValueError(
-                    "Expected exactly one orientation tool call; response retained"
+                    "Expected exactly one stage tool call; response retained"
                 )
             save_json(directory, response_name, {"items": output})
         else:
@@ -210,7 +304,7 @@ def run_agent(
         )
         if not all(isinstance(v, str) for v in (name, arguments, call_id)):
             raise ValueError("Malformed function call")
-        result_name = f"debug/turn-{state['turn']:04d}.tool.json"
+        result_name = f"debug/{prefix}turn-{state['turn']:04d}.tool.json"
         if not local_path(directory, result_name).exists():
             display.tool_call(str(name), str(arguments))
             try:
@@ -241,7 +335,8 @@ def run_agent(
             )
             result = JSON_OBJECT.validate_json(str(saved_items[0]["output"]))
         if (
-            name == "update_profile"
+            run.stage == "orientation"
+            and name == "update_profile"
             and result.get("saved") is True
             and not state.get("baseline")
         ):
@@ -270,7 +365,12 @@ def run_agent(
     save_run(directory, run)
     try:
         tools.validate_artifacts()
-        checkpoint_path = local_path(directory, "checkpoints.sqlite")
+        checkpoint_path = local_path(
+            directory,
+            "research/checkpoints.sqlite"
+            if research is not None
+            else "checkpoints.sqlite",
+        )
         with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
             compiled = graph.compile(checkpointer=saver)
             snapshot = compiled.get_state(config)
@@ -283,11 +383,18 @@ def run_agent(
                     )
             else:
                 initial: State | None = (
-                    None if snapshot.values else {"history": ["user.json"], "turn": 0}
+                    None
+                    if snapshot.values
+                    else {
+                        "history": [] if research is not None else ["user.json"],
+                        "turn": 0,
+                    }
                 )
                 compiled.invoke(initial, config=config)
         if not tools.complete():
-            raise ValueError("Orientation did not produce all required outputs")
+            raise ValueError(
+                f"{run.stage.capitalize()} did not produce all required outputs"
+            )
     except Exception as exc:
         # Our boundary errors carry safe context; unexpected error messages may contain data.
         run.error = (
@@ -298,7 +405,7 @@ def run_agent(
         )
         save_json(
             directory,
-            f"debug/failure-{run.model_calls:04d}.json",
+            f"debug/{prefix}failure-{run.model_calls:04d}.json",
             {"error": run.error, "type": type(exc).__name__},
         )
         save_run(directory, run)

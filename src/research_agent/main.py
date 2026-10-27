@@ -1,4 +1,4 @@
-"""Start or resume one orientation run: python -m research_agent.main --help."""
+"""Start, research, or resume one company run: python -m research_agent.main --help."""
 
 import os
 from pathlib import Path
@@ -7,12 +7,20 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
-from research_agent.agent import OpenAIModel, initialize_prompts, run_agent
+from research_agent.agent import (
+    OpenAIModel,
+    begin_research,
+    initialize_prompts,
+    run_agent,
+)
 from research_agent.cli import CLI, configure_logging, parser
 from research_agent.storage import (
+    RESEARCH_START,
     Inputs,
     Run,
     Settings,
+    activate_research,
+    local_path,
     read_json,
     run_directory,
     run_lock,
@@ -52,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     display = CLI()
     directory: Path | None = None
     summary_ready = False
+    stage = "Orientation"
     try:
         root = (
             args.data_dir or Path(os.environ.get("RESEARCH_DATA_DIR", "data"))
@@ -80,7 +89,22 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     "Unsupported run format or mismatched ID; legacy runs are not migrated"
                 )
+            if (
+                args.action == "resume"
+                and local_path(directory, RESEARCH_START).exists()
+            ):
+                activate_research(directory, run)
+            stage = run.stage.capitalize()
             if args.action == "resume":
+                if args.page_budget is not None:
+                    if run.stage != "research":
+                        raise ValueError(
+                            "--page-budget applies only to active research"
+                        )
+                    updated = Run.model_validate(
+                        {**run.model_dump(), "research_page_budget": args.page_budget}
+                    )
+                    run.research_page_budget = updated.research_page_budget
                 updates = {
                     key: getattr(args, key)
                     for key in ("max_model_calls", "input_allowance")
@@ -89,6 +113,33 @@ def main(argv: list[str] | None = None) -> int:
                 run.settings = Settings.model_validate(
                     {**run.settings.model_dump(), **updates}
                 )
+            openai_key, firecrawl_key = (
+                os.environ.get("OPENAI_API_KEY", ""),
+                os.environ.get("FIRECRAWL_API_KEY", ""),
+            )
+            if not openai_key or not firecrawl_key:
+                raise ValueError(
+                    f"Set OPENAI_API_KEY and FIRECRAWL_API_KEY; {run.stage} is incomplete"
+                )
+            tools = OrientationTools(
+                directory,
+                run.inputs,
+                run.settings,
+                FirecrawlPages(firecrawl_key, run.settings),
+                run,
+            )
+            if args.action == "research":
+                # Prepare the durable context before selecting the research stage.
+                begin_research(
+                    directory,
+                    run,
+                    tools,
+                    model_calls=args.model_calls,
+                    page_budget=args.page_budget,
+                    input_allowance=args.input_allowance,
+                    index_result_limit=args.index_result_limit,
+                )
+                stage = "Research"
             display = CLI(directory)
             summary_ready = True
             display.event(
@@ -97,22 +148,8 @@ def main(argv: list[str] | None = None) -> int:
                 {"Model": run.settings.model},
             )
             display.skill(
-                "orientation",
+                run.stage,
                 "Using saved instructions" if args.action == "resume" else "Loaded",
-            )
-            openai_key, firecrawl_key = (
-                os.environ.get("OPENAI_API_KEY", ""),
-                os.environ.get("FIRECRAWL_API_KEY", ""),
-            )
-            if not openai_key or not firecrawl_key:
-                raise ValueError(
-                    "Set OPENAI_API_KEY and FIRECRAWL_API_KEY; saved run is incomplete"
-                )
-            tools = OrientationTools(
-                directory,
-                run.inputs,
-                run.settings,
-                FirecrawlPages(firecrawl_key, run.settings),
             )
             run_agent(
                 directory,
@@ -123,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             display.event(
                 "Complete",
-                "Orientation complete",
+                f"{stage} complete",
                 {
                     name: str(directory.resolve() / name)
                     for name in ("profile.md", "sources", "site_index.json")
@@ -136,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(exc, ValidationError)
             else str(exc)
         )
-        display.event("Error", f"Orientation incomplete: {detail}")
+        display.event("Error", f"{stage} incomplete: {detail}")
         if directory is not None:
             display.event(
                 "Saved work",

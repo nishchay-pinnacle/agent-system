@@ -114,6 +114,11 @@ class CLI:
             else f"{total_calls} recorded; earlier Firecrawl calls unavailable",
             "Counting": "Logical requests across all resumes; includes failed/reserved calls, excludes SDK retries and cached reuse",
         }
+        details["Stage"] = run.stage
+        if run.stage == "research":
+            details["Research page attempts"] = (
+                f"{run.research_page_attempts} / {run.research_page_budget}"
+            )
         if missing:
             details["Token coverage"] = (
                 f"{missing} model request(s) have no reported usage; excluded from token totals"
@@ -142,7 +147,7 @@ class CLI:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Start or resume an orientation research run"
+        description="Orient a company profile, explicitly continue research, or resume"
     )
     actions = result.add_subparsers(dest="action", required=True)
     start = actions.add_parser("start", help="Create a new orientation run")
@@ -157,7 +162,40 @@ def parser() -> argparse.ArgumentParser:
     resume.add_argument(
         "--input-allowance", type=int, help="Explicit new conservative input allowance"
     )
-    for command in (start, resume):
+    resume.add_argument(
+        "--page-budget",
+        type=int,
+        help="Explicit new total research page-fetch allowance",
+    )
+    research = actions.add_parser(
+        "research", help="Explicitly continue a completed orientation into research"
+    )
+    research.add_argument("--run-id", required=True)
+    research.add_argument(
+        "--model-calls",
+        required=True,
+        type=int,
+        help="Additional model calls for research (1-1000)",
+    )
+    research.add_argument(
+        "--page-budget",
+        required=True,
+        type=int,
+        help="New research page-fetch attempts, including failures",
+    )
+    research.add_argument(
+        "--input-allowance",
+        required=True,
+        type=int,
+        help="Conservative full research input allowance; no compaction",
+    )
+    research.add_argument(
+        "--index-result-limit",
+        type=int,
+        default=20,
+        help="Default index query page size (1-50)",
+    )
+    for command in (start, resume, research):
         command.add_argument(
             "--data-dir",
             type=Path,
