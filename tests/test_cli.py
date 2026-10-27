@@ -27,6 +27,7 @@ def test_start_and_resume_cli_with_fake_providers(
         main.main(
             [
                 "start",
+                "--orientation-only",
                 "--company",
                 inputs.company,
                 "--product",

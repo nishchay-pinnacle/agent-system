@@ -8,7 +8,7 @@ Retrieve an original file with `git show <original-sha>:<path>`.
 
 ## Reading the implementation
 
-1. `main.py` validates environment settings and starts/resumes one run or explicitly activates research.
+1. `main.py` validates environment settings and starts/resumes one run and coordinates automatic or explicit research activation.
    `cli.py` owns argument parsing and all terminal presentation: model calls and
    reported token totals, tool arguments/results, skills, completion and errors.
    Usage totals are reconstructed from existing response records, not new state.
@@ -101,7 +101,31 @@ for both input sources, but does not prove the model's prose is factually correc
 
 ## Research continuation
 
-Run `uv run python -m research_agent.main research --run-id orientation_YOUR_RUN_ID
+`start` now runs both stages by default; `start --orientation-only` stops after
+orientation. Its `--model-calls 30 --page-budget 20 --input-allowance 160000
+--index-result-limit 20` defaults configure research only. Orientation continues to
+use the existing environment configuration.
+
+`run.json` stores a nullable `workflow_intent`: the full-workflow choice and all four
+research allowances, validated and persisted when creating the run. Missing intent
+on old records means no automatic research; no migration or checkpoint reset occurs.
+After `run_agent` successfully completes and validates orientation, the CLI calls
+`begin_research` with the saved allowances, then calls the same `run_agent` for
+research. Both stages share the existing run lock and model client configuration.
+Orientation failure returns immediately without preparing research. The terminal
+announces the handoff, reports errors for the active stage, and emits one cumulative
+summary; it does not announce full completion between stages.
+
+Resume first activates any already prepared research snapshot using the existing
+transition mechanism. Otherwise it resumes orientation and performs the pending
+handoff only if saved intent requests it. This covers interruption before snapshot
+creation, after snapshot creation, and after activation. Active research bypasses
+the handoff, preserving current limits and attempts. Completed research resumes
+without provider calls. Resume overrides apply to the current stage; research
+allowances saved in workflow intent are used at a later automatic transition.
+
+To extend an old or orientation-only run explicitly, run
+`uv run python -m research_agent.main research --run-id orientation_YOUR_RUN_ID
 --model-calls 30 --page-budget 20 --input-allowance 160000` (on one shell line).
 The existing two-node graph runs the research skill with stage-specific tools.
 The model picks material gaps, queries discovery, reads full cleaned evidence,

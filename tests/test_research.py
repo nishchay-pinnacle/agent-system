@@ -532,7 +532,12 @@ def test_old_orientation_run_defaults_and_explicit_research_cli(
     (tmp_path / "runs").mkdir()
     directory, run, pages = oriented(tmp_path / "runs")
     saved = read_json(directory, "run.json")
-    for key in ("stage", "research_page_budget", "research_page_attempts"):
+    for key in (
+        "stage",
+        "research_page_budget",
+        "research_page_attempts",
+        "workflow_intent",
+    ):
         saved.pop(key)
     saved["settings"].pop("index_result_limit")
     save_json(directory, "run.json", saved)

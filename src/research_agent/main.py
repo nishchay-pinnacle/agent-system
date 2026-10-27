@@ -19,6 +19,7 @@ from research_agent.storage import (
     Inputs,
     Run,
     Settings,
+    WorkflowIntent,
     activate_research,
     local_path,
     read_json,
@@ -76,6 +77,13 @@ def main(argv: list[str] | None = None) -> int:
                     instructions=args.instructions,
                 ),
                 settings=environment_settings(),
+                workflow_intent=WorkflowIntent(
+                    full_workflow=not args.orientation_only,
+                    model_calls=args.model_calls,
+                    page_budget=args.page_budget,
+                    input_allowance=args.input_allowance,
+                    index_result_limit=args.index_result_limit,
+                ),
             )
             directory = run_directory(root, run.run_id)
             directory.mkdir(parents=True, exist_ok=False)
@@ -89,10 +97,12 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     "Unsupported run format or mismatched ID; legacy runs are not migrated"
                 )
+            stage = run.stage.capitalize()
             if (
                 args.action == "resume"
                 and local_path(directory, RESEARCH_START).exists()
             ):
+                stage = "Research"
                 activate_research(directory, run)
             stage = run.stage.capitalize()
             if args.action == "resume":
@@ -129,6 +139,7 @@ def main(argv: list[str] | None = None) -> int:
                 run,
             )
             if args.action == "research":
+                stage = "Research"
                 # Prepare the durable context before selecting the research stage.
                 begin_research(
                     directory,
@@ -151,13 +162,38 @@ def main(argv: list[str] | None = None) -> int:
                 run.stage,
                 "Using saved instructions" if args.action == "resume" else "Loaded",
             )
+            model = OpenAIModel(openai_key, run.settings.timeout_seconds)
             run_agent(
                 directory,
                 run,
-                OpenAIModel(openai_key, run.settings.timeout_seconds),
+                model,
                 tools,
                 display,
             )
+            intent = run.workflow_intent
+            if (
+                run.stage == "orientation"
+                and intent is not None
+                and intent.full_workflow
+            ):
+                # run_agent returned successfully and validated orientation artifacts.
+                # Keep this handoff inside the same run lock; begin_research persists
+                # the snapshot before activation and reuses a prepared transition.
+                stage = "Research"
+                display.event(
+                    "Workflow", "Orientation complete — continuing to research"
+                )
+                begin_research(
+                    directory,
+                    run,
+                    tools,
+                    model_calls=intent.model_calls,
+                    page_budget=intent.page_budget,
+                    input_allowance=intent.input_allowance,
+                    index_result_limit=intent.index_result_limit,
+                )
+                display.skill("research", "Loaded")
+                run_agent(directory, run, model, tools, display)
             display.event(
                 "Complete",
                 f"{stage} complete",

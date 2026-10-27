@@ -95,6 +95,17 @@ class Settings(BaseModel):
     index_result_limit: int = Field(default=20, ge=1, le=50)
 
 
+class WorkflowIntent(BaseModel):
+    """Creation-time choice; absent on runs created before automatic continuation."""
+
+    model_config = ConfigDict(extra="forbid")
+    full_workflow: bool
+    model_calls: int = Field(ge=1, le=1000)
+    page_budget: int = Field(ge=1, le=10000)
+    input_allowance: int = Field(ge=1000)
+    index_result_limit: int = Field(ge=1, le=50)
+
+
 class Run(BaseModel):
     version: int = 1
     run_id: str
@@ -104,6 +115,7 @@ class Run(BaseModel):
     model_calls: int = 0
     error: str | None = None
     stage: Literal["orientation", "research"] = "orientation"
+    workflow_intent: WorkflowIntent | None = None
     research_page_budget: int = Field(default=0, ge=0, le=10000)
     research_page_attempts: int = Field(default=0, ge=0)
 

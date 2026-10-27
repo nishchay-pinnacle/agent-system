@@ -1,8 +1,8 @@
 # Company research agent
 
 One local Python agent first reads your company and product overview pages, writes
-a provisional Markdown profile, maps the company site, and stops. You can explicitly
-continue that completed orientation into HTML research: the same agent searches
+a provisional Markdown profile, and maps the company site. By default it then
+automatically continues into HTML research: the same agent searches
 the saved index, reads selected evidence, revises the profile, and finishes with a
 reason. Orientation and research are runtime-loaded skills of the same agent.
 
@@ -39,6 +39,29 @@ uv run python -m research_agent.main start \
 uv run python -m research_agent.main resume --run-id orientation_YOUR_RUN_ID
 ```
 
+`start` runs orientation → research in one invocation. Research defaults to 30
+additional model calls, 20 new page-fetch attempts, a 160000-byte conservative
+input allowance, and 20 index results per query. Override these on `start` with
+`--model-calls`, `--page-budget`, `--input-allowance`, and `--index-result-limit`.
+These flags apply only to research; orientation retains the environment settings.
+The model-call ceiling remains cumulative across both stages.
+
+To stop after orientation instead:
+
+```bash
+uv run python -m research_agent.main start --orientation-only \
+  --company "Example Company" --product "Example Product" \
+  --company-url "https://example.com/" \
+  --product-url "https://example.com/product"
+```
+
+The workflow choice and research allowances are saved at creation. Resume finishes
+interrupted orientation and performs any pending automatic transition for full
+workflow runs. Orientation errors stop before research. Only research completion
+reports the full workflow complete; the terminal shows “Orientation complete —
+continuing to research” at the handoff. Active research resumes with its current
+budgets, and completed research makes no new provider calls.
+
 Identical starting URLs are read once. Orientation completes only after both starting
 pages have been read successfully, a nonempty profile with saved-source references
 exists, and mapping succeeds. Missing information can remain unknown in the profile.
@@ -47,7 +70,8 @@ uses saved captures, model responses, and tool results. It does not support lega
 `agent_system` jobs. Their data remains untouched.
 
 Limits are persisted at start. Resume keeps the original model and configuration,
-with explicit limit overrides:
+with explicit limit overrides for the current stage (a pending automatic handoff
+still uses the research allowances saved at creation):
 
 ```bash
 uv run python -m research_agent.main resume --run-id orientation_YOUR_RUN_ID \
@@ -59,7 +83,8 @@ capacity, including output tokens. Full evidence is never silently truncated.
 
 ## Continue into research
 
-Use the same run ID after orientation completes. All three allowances are required;
+For an older or `--orientation-only` run, use the same run ID after orientation
+completes. All three allowances are required;
 this command also makes paid provider calls:
 
 ```bash
@@ -104,8 +129,10 @@ uv run python -m research_agent.main resume --run-id orientation_YOUR_RUN_ID \
   --max-model-calls 60 --page-budget 30 --input-allowance 200000
 ```
 
-Normal `start` and `resume` never opt an orientation run into research. An interrupted
-explicit research transition is completed on resume. Its initial profile and
+Runs created before automatic continuation have no saved workflow intent and keep
+their previous behavior: resume never opts them into research. The same applies
+to new `--orientation-only` runs. An interrupted research transition is completed
+on resume once its snapshot exists. Its initial profile and
 instructions are frozen before activation; later profile edits do not change that
 saved context. A completed research run resumes without new calls; starting a
 second research phase on that run is not supported.
@@ -139,7 +166,7 @@ Each run lives under `data/runs/<run_id>/`:
   discovery limitations. Sitemap/subdomain mapping is broad, never exhaustive.
 - `sources/`: original capture JSON (HTML, raw HTML, Markdown), complete cleaned
   Markdown, metadata, hashes, cleaning details, and retained failed captures.
-- `run.json`: inputs, configuration, stage/status, cumulative requests, research fetch budget and attempts.
+- `run.json`: inputs, configuration, stage/status, cumulative requests, research fetch budget/attempts, and creation-time workflow intent with research allowances.
 - `checkpoints.sqlite`: framework-managed execution state with file references.
 - `debug/`: model requests/responses, complete tool results and failure records.
 - `system.md`, `user.json`: original orientation prompt and skill snapshots.

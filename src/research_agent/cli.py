@@ -147,13 +147,16 @@ class CLI:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Orient a company profile, explicitly continue research, or resume"
+        description="Run orientation and research, or resume a saved run"
     )
     actions = result.add_subparsers(dest="action", required=True)
-    start = actions.add_parser("start", help="Create a new orientation run")
+    start = actions.add_parser("start", help="Run orientation then research")
     for name in ("company", "product", "company-url", "product-url"):
         start.add_argument(f"--{name}", required=True)
     start.add_argument("--instructions", default="")
+    start.add_argument(
+        "--orientation-only", action="store_true", help="Stop after orientation"
+    )
     resume = actions.add_parser("resume", help="Resume a new-format run")
     resume.add_argument("--run-id", required=True)
     resume.add_argument(
@@ -171,30 +174,30 @@ def parser() -> argparse.ArgumentParser:
         "research", help="Explicitly continue a completed orientation into research"
     )
     research.add_argument("--run-id", required=True)
-    research.add_argument(
-        "--model-calls",
-        required=True,
-        type=int,
-        help="Additional model calls for research (1-1000)",
-    )
-    research.add_argument(
-        "--page-budget",
-        required=True,
-        type=int,
-        help="New research page-fetch attempts, including failures",
-    )
-    research.add_argument(
-        "--input-allowance",
-        required=True,
-        type=int,
-        help="Conservative full research input allowance; no compaction",
-    )
-    research.add_argument(
-        "--index-result-limit",
-        type=int,
-        default=20,
-        help="Default index query page size (1-50)",
-    )
+    for command in (start, research):
+        for flag, default, help_text in (
+            (
+                "model-calls",
+                30,
+                "Additional research model calls (cumulative ceiling 1000)",
+            ),
+            (
+                "page-budget",
+                20,
+                "Research page-fetch attempts, including failures (1-10000)",
+            ),
+            ("input-allowance", 160000, "Full research input allowance; no compaction"),
+            ("index-result-limit", 20, "Default research index query page size (1-50)"),
+        ):
+            command.add_argument(
+                f"--{flag}",
+                type=int,
+                default=default
+                if command is start or flag == "index-result-limit"
+                else None,
+                required=command is research and flag != "index-result-limit",
+                help=help_text + (f"; default {default}" if command is start else ""),
+            )
     for command in (start, resume, research):
         command.add_argument(
             "--data-dir",
