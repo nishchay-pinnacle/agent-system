@@ -18,14 +18,6 @@ test -e .env || cp .env.example .env
 Set `OPENAI_API_KEY`, `FIRECRAWL_API_KEY`, and `OPENAI_MODEL` in `.env`. The exact
 model must support Responses API strict tools and encrypted reasoning replay.
 There is no default model or fallback. Shell variables take precedence over `.env`.
-Set `RESEARCH_CONTEXT_TOKENS` to your model's supported context capacity; the
-128000 default is a configured ceiling, not model metadata.
-
-Token counting uses tiktoken 0.14.0. Known models use its registered encoding;
-unknown models fail explicitly. Set `RESEARCH_ENCODING` to a verified encoding
-name if needed (for example `o200k_base` for supported GPT-5 models). The first
-encoding load may download its public vocabulary; subsequent counting is local.
-See the [official model mapping](https://github.com/openai/tiktoken/blob/main/tiktoken/model.py).
 
 ## Start and resume
 
@@ -42,31 +34,36 @@ uv run python -m research_agent.main resume --run-id orientation_YOUR_RUN_ID
 
 `start --orientation-only` stops after the initial profile, question index, and
 site map. Identical starting URLs are read once. To explicitly continue a completed
-version-2 orientation:
+version-3 orientation:
 
 ```bash
 uv run python -m research_agent.main research --run-id orientation_YOUR_RUN_ID \
-  --model-calls 30 --page-budget 20 --input-token-limit 96000
+  --model-calls 30 --page-budget 20 --max-input-bytes 1000000
 ```
 
-Those three flags are required for explicit research and have the shown defaults
-on `start`. They apply to research; orientation uses environment settings.
+The model-call and page-budget flags are required for explicit research.
+`--max-input-bytes` defaults to 1,000,000 on start and research. These flags
+apply to research; orientation uses environment settings.
 `--index-result-limit` defaults to 20. Model-call allowances are additional at
 transition (maximum cumulative ceiling 1000); page budgets include failed fetches
 but exclude cached reuse and SDK retries. Resume overrides are total ceilings:
 
 ```bash
 uv run python -m research_agent.main resume --run-id orientation_YOUR_RUN_ID \
-  --max-model-calls 60 --page-budget 30 --input-token-limit 110000 \
-  --context-tokens 128000
+  --max-model-calls 60 --page-budget 30 --max-input-bytes 2000000
 ```
 
-Input estimates include instructions, retained exchanges, tool schemas, and framing
-reserve. Output space is reserved inside context capacity. Encrypted reasoning is
-opaque: each payload reserves the configured output maximum rather than tokenizing
-ciphertext. These estimates are not provider usage. No compaction or silent
-truncation occurs. Budget/context exhaustion leaves work incomplete and never
-changes open questions to interview questions automatically.
+The complete assembled request—including instructions, all retained exchanges,
+tool definitions, and encrypted reasoning—is serialized as compact JSON and
+measured in UTF-8 bytes. `max_input_bytes` defaults to **1,000,000 bytes**; configure
+orientation with `RESEARCH_MAX_INPUT_BYTES`, research with `--max-input-bytes`, and
+resume with the same flag. This is an application size limit, **not a guarantee
+that the request fits the model context**. There is no tokenizer or reasoning-token
+reserve. Actual input/output token metrics still come from API responses.
+
+All history is retained. Exceeding the byte limit or receiving a provider context-
+limit error leaves the run incomplete with saved progress. No compaction, silent
+truncation, or automatic deferral of questions occurs.
 
 ## Research behavior
 
@@ -74,6 +71,10 @@ changes open questions to interview questions automatically.
 The active question guides source selection, not what may be learned. Record useful
 evidence for every affected question, including clearly labeled, cited inference.
 Question order expresses priority. Answers are documented, inferred, or mixed.
+Updates cannot omit existing question IDs. To merge, retain the original question
+with status `merged`, set `merged_into` to a distinct non-merged question, and give
+a `closure_reason`. Its evidence remains saved; the surviving question must be
+answered or deferred before completion.
 
 Assess only relevant, successfully read sources. Three distinct consecutive pages
 without progress permit `needs_interview`; useful evidence resets that question's
@@ -108,9 +109,12 @@ credentials. Start/resume remains in the CLI. The left pane follows activity onl
 while you are at the bottom. The right pane shows saved metrics, per-call usage,
 questions in saved priority order, the profile, and full cleaned sources. Clicking
 `[S1]` opens that source. Both panes scroll independently; polling preserves tab,
-expansion, and scroll state. Unknown usage is shown as unavailable; cached input
+expansion, and scroll state. “Request size / byte limit” shows the application request size. Unknown usage is shown as unavailable; cached input
 and reasoning output are subsets, never added twice. Profile rendering supports
-headings, paragraphs, and citations; arbitrary HTML is displayed as text.
+headings, lists, tables, emphasis, links, and clickable citations using the existing
+Markdown parser with raw HTML disabled. Images are rendered as alt text. Polling
+waits for each cycle to complete before scheduling the next; run switches invalidate
+in-flight results.
 
 ## Configuration
 
@@ -120,14 +124,12 @@ headings, paragraphs, and citations; arbitrary HTML is displayed as text.
 | `OPENAI_API_KEY`, `FIRECRAWL_API_KEY` | required for research | Provider credentials |
 | `RESEARCH_DATA_DIR` | `data` | Data root; CLI `--data-dir` overrides |
 | `RESEARCH_MAX_MODEL_CALLS` | `12` | Orientation model-call ceiling |
-| `RESEARCH_INPUT_TOKEN_LIMIT` | `96000` | Estimated input-token ceiling |
-| `RESEARCH_CONTEXT_TOKENS` | `128000` | Configured context capacity, including output |
-| `RESEARCH_ENCODING` | model mapping | Explicit verified tiktoken encoding |
+| `RESEARCH_MAX_INPUT_BYTES` | `1000000` | Complete serialized-request UTF-8 byte limit |
 | `RESEARCH_OUTPUT_TOKENS` | `8000` | Maximum output tokens |
 | `RESEARCH_TIMEOUT_SECONDS` | `120` | Provider attempt timeout |
 | `RESEARCH_MAP_LIMIT` | `5000` | Discovery entry limit |
 
-Old byte allowance options/settings are not interpreted as token values. OpenAI
+Old token-limit and encoding settings are removed, not reinterpreted as bytes. OpenAI
 retries once; Firecrawl permits two total attempts. No outer retry loop is added.
 Logical reservations count failures, while SDK retries may incur extra charges.
 
@@ -135,18 +137,18 @@ Logical reservations count failures, while SDK retries may incur extra charges.
 
 Runs live in `data/runs/<run_id>/`:
 
-- `run.json` (version 2), `profile.md`, `questions.json`, `source_index.json`, and
+- `run.json` (version 3), `profile.md`, `questions.json`, `source_index.json`, and
   `site_index.json`: state, findings, priorities, source IDs, and discovery leads.
 - `sources/`: complete cleaned Markdown, captures, hashes, and failed captures.
 - `events.jsonl`: sanitized CLI events used for incremental dashboard polling.
-- `debug/`: requests, responses, full tool results, usage, context estimate, failures.
+- `debug/`: requests, responses, full tool results, usage, request byte size, failures.
 - `checkpoints.sqlite`, `research/checkpoints.sqlite`: same run ID, transcript
   references rather than large payloads. Research starts with orientation history.
 - `system.md`, `user.json`, `research/start.json`, `research/user.json`: frozen
   instructions and durable handoff references. `research/completion.json` records
   successful completion after final artifact writes.
 
-Legacy runs remain untouched and viewable with unavailable fields labeled, but
+Version-1/2 runs remain untouched and viewable with unavailable fields labeled, but
 cannot resume under the new schemas or frozen prompts. Start a new run; there is
 no automatic migration. `.env`, `.venv`, and `data/` are ignored. Run artifacts
 contain private research/transcripts; only one writer may hold a run's local lock.
@@ -158,6 +160,8 @@ uv run ruff check .
 uv run ruff format --check .
 uv run mypy src/research_agent
 uv run pytest
+# Optional standalone scheduler regression (Node.js; no packages):
+node tests/dashboard_polling.cjs
 ```
 
 Tests use fake providers and temporary files with real SQLite persistence. They

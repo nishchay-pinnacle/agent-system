@@ -88,9 +88,7 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str = Field(min_length=1)
     max_model_calls: int = Field(default=12, ge=1, le=1000)
-    input_token_limit: int = Field(default=96000, ge=1000)
-    context_tokens: int = Field(default=128000, ge=1000)
-    encoding: str | None = None
+    max_input_bytes: int = Field(default=1_000_000, ge=1)
     output_tokens: int = Field(default=8000, ge=256)
     timeout_seconds: float = Field(default=120, gt=0, le=3600)
     map_limit: int = Field(default=5000, ge=1, le=100000)
@@ -104,12 +102,12 @@ class WorkflowIntent(BaseModel):
     full_workflow: bool
     model_calls: int = Field(ge=1, le=1000)
     page_budget: int = Field(ge=1, le=10000)
-    input_token_limit: int = Field(ge=1000)
+    max_input_bytes: int = Field(default=1_000_000, ge=1)
     index_result_limit: int = Field(ge=1, le=50)
 
 
 class Run(BaseModel):
-    version: int = 2
+    version: int = 3
     run_id: str
     inputs: Inputs
     settings: Settings
@@ -224,20 +222,20 @@ RESEARCH_RECEIPT = (
 
 class ResearchStart(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    version: Literal[2] = 2
+    version: Literal[3] = 3
     original_run: Run
     system: str = Field(min_length=1)
     history: list[str]
     receipt: str = RESEARCH_RECEIPT
     model_calls: int = Field(ge=1, le=1000)
     page_budget: int = Field(ge=1, le=10000)
-    input_token_limit: int = Field(ge=1000)
+    max_input_bytes: int = Field(default=1_000_000, ge=1)
     index_result_limit: int = Field(default=20, ge=1, le=50)
 
 
 def load_research_start(directory: Path, run: Run) -> ResearchStart:
     saved = read_json(directory, RESEARCH_START)
-    if saved.get("version") != 2:
+    if saved.get("version") != 3:
         raise ValueError("Unsupported research context version; preserve run files")
     start = ResearchStart.model_validate(saved)
     if (
@@ -265,7 +263,7 @@ def activate_research(directory: Path, run: Run) -> ResearchStart:
             {
                 **start.original_run.settings.model_dump(),
                 "max_model_calls": start.original_run.model_calls + start.model_calls,
-                "input_token_limit": start.input_token_limit,
+                "max_input_bytes": start.max_input_bytes,
                 "index_result_limit": start.index_result_limit,
             }
         )
@@ -285,12 +283,13 @@ class Question(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
     id: str = Field(min_length=1, max_length=80)
     question: str = Field(min_length=1)
-    status: Literal["open", "answered", "needs_interview"]
+    status: Literal["open", "answered", "needs_interview", "merged"]
     priority_reason: str = Field(min_length=1)
     answer: str | None
     answer_basis: Literal["documented", "inferred", "mixed"] | None
     source_assessments: list[SourceAssessment]
     closure_reason: str | None
+    merged_into: str | None = None
 
     @property
     def unproductive_pages(self) -> int:

@@ -121,9 +121,7 @@ def setup_run(
     run = Run(
         run_id="orientation_test",
         inputs=inputs,
-        settings=Settings(
-            model="explicit-test-model", encoding="o200k_base", **settings
-        ),
+        settings=Settings(model="explicit-test-model", **settings),
     )
     directory = run_directory(tmp_path, run.run_id)
     directory.mkdir()
@@ -225,21 +223,21 @@ def test_model_limit_persists_and_can_be_explicitly_increased(tmp_path: Path) ->
 def test_oversized_page_preserved_whole_then_resume_without_refetch(
     tmp_path: Path,
 ) -> None:
-    directory, run, model, pages = setup_run(tmp_path, input_token_limit=10000)
+    directory, run, model, pages = setup_run(tmp_path, max_input_bytes=10000)
     pages.large = True
     with pytest.raises(ValueError, match="Nothing truncated"):
         execute(directory, run, model, pages)
     path = directory / f"sources/{source_id(run.inputs.company_url)}.md"
     assert path.read_text().count("long evidence") == 10000
     reopened = Run.model_validate(read_json(directory, "run.json"))
-    reopened.settings.input_token_limit = 1000000
+    reopened.settings.max_input_bytes = 1000000
     fresh_pages = FakePages()
     execute(directory, reopened, FakeModel(run.inputs), fresh_pages)
     assert fresh_pages.scraped == [run.inputs.product_url]
 
 
 def test_total_context_allowance_stops_before_model(tmp_path: Path) -> None:
-    directory, run, model, pages = setup_run(tmp_path, input_token_limit=1000)
+    directory, run, model, pages = setup_run(tmp_path, max_input_bytes=1000)
     with pytest.raises(ValueError, match="Complete model input"):
         execute(directory, run, model, pages)
     assert not model.requests and run.model_calls == 0

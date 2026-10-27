@@ -29,7 +29,6 @@ from research_agent.storage import (
     save_run,
     write_text,
 )
-from research_agent.token_counting import estimate_input
 from research_agent.tools import OrientationTools, ToolInputError, tool_models
 
 CREATE_PARAMS = TypeAdapter(ResponseCreateParamsNonStreaming)
@@ -114,10 +113,10 @@ def begin_research(
     *,
     model_calls: int,
     page_budget: int,
-    input_token_limit: int,
+    max_input_bytes: int,
     index_result_limit: int = 20,
 ) -> None:
-    if run.version != 2:
+    if run.version != 3:
         raise ValueError("Legacy runs cannot resume under new schemas; start a new run")
     if run.stage != "orientation" or run.status != "complete":
         raise ValueError(
@@ -146,7 +145,7 @@ def begin_research(
             history=history,
             model_calls=model_calls,
             page_budget=page_budget,
-            input_token_limit=input_token_limit,
+            max_input_bytes=max_input_bytes,
             index_result_limit=index_result_limit,
         )
         # Validate the cumulative limit before persisting the transition intent.
@@ -162,9 +161,9 @@ def begin_research(
         if (
             start.model_calls,
             start.page_budget,
-            start.input_token_limit,
+            start.max_input_bytes,
             start.index_result_limit,
-        ) != (model_calls, page_budget, input_token_limit, index_result_limit):
+        ) != (model_calls, page_budget, max_input_bytes, index_result_limit):
             raise ValueError(
                 "Research transition already prepared with different allowances; use resume"
             )
@@ -179,7 +178,7 @@ def definitions(stage: str = "orientation") -> list[dict[str, JsonValue]]:
             "description": {
                 "read_page": "Read a permitted HTML page; returns full cleaned evidence and its saved source reference.",
                 "update_profile": "Replace the full Markdown profile with saved-source citations and remaining uncertainties.",
-                "update_questions": "Save the full ordered question index and active question. Assess relevant successfully read sources for every affected question; useful evidence resets that question’s streak. Preserve prior assessments in order.",
+                "update_questions": "Save the full ordered question index and active question. Assess relevant successfully read sources for every affected question; useful evidence resets that question’s streak. Preserve every existing question ID and prior assessments. Explicit merges retain the original question with status merged, merged_into naming a non-merged target, and closure_reason.",
                 "build_site_index": "Map the company root broadly after saving the profile; returns counts and limitations, then orientation stops.",
                 "query_site_index": "Search any query term across URL/title/description; rank by matched terms then URL. Optional required_phrase and url_contains constrain results. Empty query browses. Paginated discovery only.",
                 "finish_research": "Validate and save final profile, full question index and reason before completion. No open questions permitted.",
@@ -198,7 +197,7 @@ def run_agent(
     tools: OrientationTools,
     display: CLI | None = None,
 ) -> None:
-    if run.version != 2:
+    if run.version != 3:
         raise ValueError("Legacy runs cannot resume under new schemas; start a new run")
     display = display or CLI(directory)
     research = None
@@ -240,14 +239,24 @@ def run_agent(
                 "max_output_tokens": run.settings.output_tokens,
                 "truncation": "disabled",
             }
-            estimate = estimate_input(request, run.settings)
-            save_json(directory, "debug/context.json", estimate)
-            if estimate["estimated_tokens"] > min(
-                run.settings.input_token_limit,
-                run.settings.context_tokens - run.settings.output_tokens,
-            ):
+            # Count the complete application request, including opaque reasoning,
+            # using compact UTF-8 JSON. This is not a model context estimate.
+            request_bytes = len(
+                json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            )
+            save_json(
+                directory,
+                "debug/context.json",
+                {
+                    "request_bytes": request_bytes,
+                    "max_input_bytes": run.settings.max_input_bytes,
+                },
+            )
+            if request_bytes > run.settings.max_input_bytes:
                 raise ValueError(
-                    f"Complete model input estimated at {estimate['estimated_tokens']} tokens exceeds input/context limit. Nothing truncated. Resume with --input-token-limit and --context-tokens only within the model's capacity."
+                    f"Complete model input is {request_bytes} UTF-8 bytes; max_input_bytes is {run.settings.max_input_bytes}. Nothing truncated. Run incomplete; resume with --max-input-bytes to raise the application size limit. This does not guarantee the request fits the model context."
                 )
             if run.model_calls >= run.settings.max_model_calls:
                 raise ValueError(

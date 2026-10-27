@@ -43,9 +43,7 @@ def environment_settings() -> Settings:
                 field: os.environ[env]
                 for field, env in {
                     "max_model_calls": "RESEARCH_MAX_MODEL_CALLS",
-                    "input_token_limit": "RESEARCH_INPUT_TOKEN_LIMIT",
-                    "context_tokens": "RESEARCH_CONTEXT_TOKENS",
-                    "encoding": "RESEARCH_ENCODING",
+                    "max_input_bytes": "RESEARCH_MAX_INPUT_BYTES",
                     "output_tokens": "RESEARCH_OUTPUT_TOKENS",
                     "timeout_seconds": "RESEARCH_TIMEOUT_SECONDS",
                     "map_limit": "RESEARCH_MAP_LIMIT",
@@ -88,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
                     full_workflow=not args.orientation_only,
                     model_calls=args.model_calls,
                     page_budget=args.page_budget,
-                    input_token_limit=args.input_token_limit,
+                    max_input_bytes=args.max_input_bytes,
                     index_result_limit=args.index_result_limit,
                 ),
             )
@@ -100,12 +98,12 @@ def main(argv: list[str] | None = None) -> int:
             directory = run_directory(root, args.run_id)
         with run_lock(directory):
             saved = read_json(directory, "run.json")
-            if saved.get("version") != 2:
+            if saved.get("version") != 3:
                 raise ValueError(
                     "Legacy runs are viewable in dashboard but cannot resume under new schemas. Start a new run; existing data is preserved."
                 )
             run = Run.model_validate(saved)
-            if run.version != 2 or run.run_id != directory.name:
+            if run.version != 3 or run.run_id != directory.name:
                 raise ValueError(
                     "Unsupported run format or mismatched ID; legacy runs are not migrated"
                 )
@@ -131,9 +129,7 @@ def main(argv: list[str] | None = None) -> int:
                     key: getattr(args, key)
                     for key in (
                         "max_model_calls",
-                        "input_token_limit",
-                        "context_tokens",
-                        "encoding",
+                        "max_input_bytes",
                     )
                     if getattr(args, key) is not None
                 }
@@ -164,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
                     tools,
                     model_calls=args.model_calls,
                     page_budget=args.page_budget,
-                    input_token_limit=args.input_token_limit,
+                    max_input_bytes=args.max_input_bytes,
                     index_result_limit=args.index_result_limit,
                 )
                 stage = "Research"
@@ -206,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
                     tools,
                     model_calls=intent.model_calls,
                     page_budget=intent.page_budget,
-                    input_token_limit=intent.input_token_limit,
+                    max_input_bytes=intent.max_input_bytes,
                     index_result_limit=intent.index_result_limit,
                 )
                 display.skill("research", "Loaded")

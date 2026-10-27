@@ -6,9 +6,28 @@ from importlib.resources import files
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from bs4 import BeautifulSoup
+from markdown_it import MarkdownIt
 from pydantic import JsonValue
 
 from research_agent.storage import local_path, read_json, run_directory
+
+
+def render_profile(content: str) -> str:
+    # CommonMark escapes raw HTML and rejects unsafe link schemes. Tables are
+    # already supported by the installed parser; no frontend dependency needed.
+    rendered = MarkdownIt("commonmark", {"html": False}).enable("table").render(content)
+    soup = BeautifulSoup(rendered, "html.parser")
+    for image in soup.find_all("img"):
+        image.replace_with(str(image.get("alt", "")))
+    for link in soup.find_all("a", href=True):
+        href = str(link["href"])
+        if urlsplit(href).scheme not in {"http", "https", "mailto"}:
+            link.unwrap()
+        else:
+            link["rel"] = "noopener noreferrer"
+            link["target"] = "_blank"
+    return str(soup)
 
 
 def state(directory: Path) -> dict[str, JsonValue]:
@@ -41,13 +60,17 @@ def state(directory: Path) -> dict[str, JsonValue]:
             }
         )
     profile = local_path(directory, "profile.md")
+    profile_text = profile.read_text() if profile.exists() else None
     return {
         "run": read_json(directory, "run.json"),
         "questions": optional("questions.json"),
         "context": optional("debug/context.json"),
         "firecrawl": optional("debug/firecrawl-counts.json"),
         "calls": calls,
-        "profile": profile.read_text() if profile.exists() else None,
+        "profile": profile_text,
+        "profile_html": render_profile(profile_text)
+        if profile_text is not None
+        else None,
         "sources": sources,
     }
 

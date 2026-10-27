@@ -54,10 +54,9 @@ def providers(
     monkeypatch.setenv("OPENAI_API_KEY", "fake")
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fake")
     monkeypatch.setenv("OPENAI_MODEL", "explicit-test-model")
-    monkeypatch.setenv("RESEARCH_ENCODING", "o200k_base")
     monkeypatch.setenv("RESEARCH_DATA_DIR", "data")
     monkeypatch.setenv("RESEARCH_MAX_MODEL_CALLS", "5")
-    monkeypatch.setenv("RESEARCH_INPUT_TOKEN_LIMIT", "96000")
+    monkeypatch.setenv("RESEARCH_MAX_INPUT_BYTES", "96000")
     model, pages = WorkflowModel(), FakePages()
     monkeypatch.setattr(main, "OpenAIModel", lambda key, timeout: model)
     monkeypatch.setattr(main, "FirecrawlPages", lambda key, settings: pages)
@@ -78,7 +77,7 @@ def test_start_runs_both_stages_and_persists_research_allowances(
             "8",
             "--page-budget",
             "3",
-            "--input-token-limit",
+            "--max-input-bytes",
             "180000",
             "--index-result-limit",
             "7",
@@ -93,13 +92,13 @@ def test_start_runs_both_stages_and_persists_research_allowances(
     assert run.workflow_intent is not None and run.workflow_intent.full_workflow
     assert run.workflow_intent.model_calls == (8 if custom else 30)
     assert run.settings.max_model_calls == (13 if custom else 35)
-    assert run.settings.input_token_limit == (180000 if custom else 96000)
+    assert run.settings.max_input_bytes == (180000 if custom else 1_000_000)
     assert run.settings.index_result_limit == (7 if custom else 20)
     assert run.research_page_budget == (3 if custom else 20)
     assert run.research_page_attempts == 1 and run.model_calls == 7
     original = read_json(directory, RESEARCH_START)["original_run"]
     assert original["settings"]["max_model_calls"] == 5
-    assert original["settings"]["input_token_limit"] == 96000
+    assert original["settings"]["max_input_bytes"] == 96000
     assert len(model.orientation.requests) == 5 and len(model.research.requests) == 2
     assert len(pages.scraped) == 3 and pages.mapped == [INPUTS.site_url]
     output = capsys.readouterr().out
@@ -140,7 +139,7 @@ def test_orientation_only_remains_orientation_on_resume(
                 "5",
                 "--page-budget",
                 "2",
-                "--input-token-limit",
+                "--max-input-bytes",
                 "160000",
             ]
         )

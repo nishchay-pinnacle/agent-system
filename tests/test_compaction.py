@@ -1,12 +1,12 @@
 """Full conversation retention replaces the obsolete orientation compaction contract."""
 
+import json
 from pathlib import Path
 
 import pytest
 from test_orientation import FakeModel, FakePages, execute, setup_run
 
-from research_agent.storage import Run, Settings, read_json
-from research_agent.token_counting import estimate_input
+from research_agent.storage import Run, read_json
 
 
 def test_orientation_retains_source_profile_and_question_exchanges_on_resume(
@@ -28,31 +28,70 @@ def test_orientation_retains_source_profile_and_question_exchanges_on_resume(
     assert not (directory / "context").exists()
 
 
-def test_tokenizer_fails_explicitly_for_unknown_model_and_reserves_opaque_reasoning() -> (
-    None
-):
-    with pytest.raises(ValueError, match="Unsupported tokenizer"):
-        estimate_input({"input": []}, Settings(model="unknown-model"))
-    settings = Settings(model="unknown-model", encoding="o200k_base")
-    short = estimate_input({"input": [{"encrypted_content": "opaque"}]}, settings)
-    long = estimate_input(
-        {"input": [{"encrypted_content": "opaque" * 10000}]}, settings
-    )
-    assert short == long
-    assert short["opaque_reasoning_reserve"] == settings.output_tokens
-
-
 def test_full_history_does_not_fit_by_silently_compacting(tmp_path: Path) -> None:
     directory, run, model, pages = setup_run(tmp_path, max_model_calls=3)
     with pytest.raises(ValueError, match="limit exhausted"):
         execute(directory, run, model, pages)
     reopened = Run.model_validate(read_json(directory, "run.json"))
     reopened.settings.max_model_calls = 6
-    reopened.settings.context_tokens = (
-        8500  # Only 500 tokens remain after output reservation.
-    )
+    reopened.settings.max_input_bytes = 1000
     fresh_model = FakeModel(run.inputs)
     with pytest.raises(ValueError, match="Nothing truncated"):
         execute(directory, reopened, fresh_model, FakePages())
     assert not fresh_model.requests
     assert read_json(directory, "debug/turn-0000.tool.json")["items"]
+
+
+def test_full_utf8_request_bytes_include_reasoning_without_token_reserve(
+    tmp_path: Path,
+) -> None:
+    class ReasoningModel(FakeModel):
+        def generate(self, request):
+            result = super().generate(request)
+            result["output"].insert(
+                0,
+                {
+                    "id": "reasoning-" + result["output"][0]["call_id"],
+                    "type": "reasoning",
+                    "encrypted_content": "opaque",
+                    "summary": [],
+                },
+            )
+            result["usage"] = {"input_tokens": 50, "output_tokens": 10}
+            return result
+
+    directory, run, _, pages = setup_run(tmp_path, max_model_calls=4)
+    run.settings.model = "gpt-6-luna"  # No tokenizer registry is needed.
+    (directory / "system.md").write_text(
+        "Research café 世界 🌍\n" + (directory / "system.md").read_text()
+    )
+    with pytest.raises(ValueError, match="limit exhausted"):
+        execute(directory, run, ReasoningModel(run.inputs), pages)
+    context = read_json(directory, "debug/context.json")
+    size = context["request_bytes"]
+    reopened = Run.model_validate(read_json(directory, "run.json"))
+    reopened.settings.max_model_calls = 5
+    reopened.settings.max_input_bytes = size - 1
+    blocked = ReasoningModel(run.inputs)
+    with pytest.raises(ValueError, match="Nothing truncated"):
+        execute(directory, reopened, blocked, FakePages())
+    assert not blocked.requests and reopened.model_calls == 4
+    assert reopened.status == "incomplete"
+    reopened = Run.model_validate(read_json(directory, "run.json"))
+    reopened.settings.max_input_bytes = size  # Exact boundary is allowed.
+    fresh = ReasoningModel(run.inputs)
+    execute(directory, reopened, fresh, FakePages())
+    request = fresh.requests[0]
+    encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    assert len(encoded) == size
+    assert len(encoded) > len(encoded.decode("utf-8"))
+    assert str(request).count("encrypted_content") >= 4
+    assert "Provisional product profile" in str(request)
+    assert request["truncation"] == "disabled"
+    assert read_json(directory, "debug/context.json") == {
+        "request_bytes": size,
+        "max_input_bytes": size,
+    }
+    assert reopened.status == "complete"

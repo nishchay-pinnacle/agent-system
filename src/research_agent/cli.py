@@ -200,15 +200,15 @@ def parser() -> argparse.ArgumentParser:
         "--max-model-calls", type=int, help="Explicit new total model-call allowance"
     )
     resume.add_argument(
-        "--input-token-limit", type=int, help="Explicit new input-token limit"
+        "--max-input-bytes",
+        type=int,
+        help="Explicit new serialized-request UTF-8 byte limit",
     )
     resume.add_argument(
         "--page-budget",
         type=int,
         help="Explicit new total research page-fetch allowance",
     )
-    resume.add_argument("--context-tokens", type=int)
-    resume.add_argument("--encoding")
     dashboard = actions.add_parser("dashboard", help="Read-only localhost dashboard")
     dashboard.add_argument("--run-id")
     dashboard.add_argument("--port", type=int, default=8765)
@@ -229,9 +229,9 @@ def parser() -> argparse.ArgumentParser:
                 "Research page-fetch attempts, including failures (1-10000)",
             ),
             (
-                "input-token-limit",
-                96000,
-                "Full research input-token limit; no compaction",
+                "max-input-bytes",
+                1_000_000,
+                "Application request-size limit in UTF-8 bytes; not a context guarantee",
             ),
             ("index-result-limit", 20, "Default research index query page size (1-50)"),
         ):
@@ -239,9 +239,10 @@ def parser() -> argparse.ArgumentParser:
                 f"--{flag}",
                 type=int,
                 default=default
-                if command is start or flag == "index-result-limit"
+                if command is start or flag in {"index-result-limit", "max-input-bytes"}
                 else None,
-                required=command is research and flag != "index-result-limit",
+                required=command is research
+                and flag not in {"index-result-limit", "max-input-bytes"},
                 help=help_text + (f"; default {default}" if command is start else ""),
             )
     for command in (start, resume, research, dashboard):

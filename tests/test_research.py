@@ -151,7 +151,7 @@ def enter(
         tools,
         model_calls=calls,
         page_budget=budget,
-        input_token_limit=allowance,
+        max_input_bytes=allowance,
     )
     tools.settings = run.settings
     return tools
@@ -516,7 +516,7 @@ def test_exhaustion_preserves_incomplete_research(tmp_path: Path, limit: str) ->
     ]
     model = ResearchModel(steps)
     if limit == "context":
-        run.settings.input_token_limit = 1000
+        run.settings.max_input_bytes = 1000
     with pytest.raises(
         (ValueError, RuntimeError),
         match={
@@ -532,7 +532,7 @@ def test_exhaustion_preserves_incomplete_research(tmp_path: Path, limit: str) ->
     assert all(request["truncation"] == "disabled" for request in model.requests)
     reopened = Run.model_validate(read_json(directory, "run.json"))
     reopened.settings.max_model_calls = 20
-    reopened.settings.input_token_limit = 96000
+    reopened.settings.max_input_bytes = 96000
     reopened.research_page_budget = 3
     fresh_model = ResearchModel(steps)
     run_agent(
@@ -607,7 +607,7 @@ def test_old_orientation_run_defaults_and_explicit_research_cli(
                 "3",
                 "--page-budget",
                 "2",
-                "--input-token-limit",
+                "--max-input-bytes",
                 "96000",
                 "--index-result-limit",
                 "5",
@@ -706,7 +706,8 @@ def test_questions_cross_question_learning_streaks_and_fresh_resume(
                 {
                     "active_question_id": None,
                     "questions": [
-                        question("Q3", [{"source_id": "S99", "useful": False}])
+                        *(q.model_dump() for q in index.questions),
+                        question("Q3", [{"source_id": "S99", "useful": False}]),
                     ],
                 }
             )
@@ -800,3 +801,60 @@ def test_blocked_layout_without_heading_and_legitimate_mentions() -> None:
         )
         is None
     )
+
+
+def test_omitted_questions_cannot_disappear_on_update_or_finish(tmp_path: Path) -> None:
+    from research_agent.storage import QuestionIndex
+
+    directory, run, pages = oriented(tmp_path)
+    tools = enter(directory, run, pages)
+    before = (directory / "questions.json").read_bytes()
+    empty = QuestionIndex(active_question_id=None, questions=[])
+    for operation in (
+        lambda: tools.update_questions(empty),
+        lambda: tools.finish_research("Done", "Final [S1]", empty),
+    ):
+        with pytest.raises(ToolInputError, match="cannot be removed: Q1"):
+            operation()
+        assert (directory / "questions.json").read_bytes() == before
+        assert not (directory / "research/completion.json").exists()
+
+
+def test_explicit_merge_preserves_question_and_requires_target_resolution(
+    tmp_path: Path,
+) -> None:
+    from research_agent.storage import QuestionIndex
+
+    directory, run, pages = oriented(tmp_path)
+    tools = enter(directory, run, pages)
+    index = QuestionIndex.model_validate(
+        {
+            "active_question_id": "Q2",
+            "questions": [
+                question(
+                    "Q1",
+                    status="merged",
+                    merged_into="Q2",
+                    closure_reason="Same adoption question",
+                ),
+                question("Q2"),
+            ],
+        }
+    )
+    tools.update_questions(index)
+    fresh = OrientationTools(directory, run.inputs, run.settings, CompanyPages(), run)
+    saved = QuestionIndex.model_validate(read_json(directory, "questions.json"))
+    with pytest.raises(ToolInputError, match="open questions"):
+        fresh.finish_research("Done", "Final [S1]", saved)
+    for target in ("Q1", "absent"):
+        bad = saved.model_copy(deep=True)
+        bad.questions[0].merged_into = target
+        with pytest.raises(ToolInputError, match="non-merged target"):
+            fresh.update_questions(bad)
+    saved.active_question_id = None
+    saved.questions[1].status = "answered"
+    saved.questions[1].answer = "Documented adoption requirements [S1]."
+    saved.questions[1].answer_basis = "documented"
+    fresh.finish_research("All questions accounted for", "Final [S1]", saved)
+    assert fresh.complete()
+    assert read_json(directory, "questions.json")["questions"][0]["merged_into"] == "Q2"

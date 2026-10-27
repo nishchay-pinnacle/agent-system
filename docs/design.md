@@ -16,7 +16,12 @@ checks combine title and short main-content signals, including pages without h1.
 
 `QuestionIndex` stores a nullable active question and ordered questions. Only an
 open question may be active. Full replacements permit reprioritizing, merging,
-adding, and reopening; existing IDs retain source assessment history. Assessments
+adding, and reopening; existing IDs retain source assessment history. Omitting an
+existing ID is rejected before saving or finishing. A merged record stays in the
+index with status `merged`, a `merged_into` target, and closure reason. Targets must
+exist, be distinct, and not themselves be merged (no chains/cycles). Finishing
+requires all surviving questions to be answered or deferred. The optional merge
+field defaults to null when absent; no files are migrated. Assessments
 are deduplicated by source ID. A correction from unproductive to useful moves that
 assessment to the end, resetting the streak; useful evidence cannot be overwritten
 as an unproductive reread. Unmentioned questions do not acquire assessments. The
@@ -38,23 +43,25 @@ Completed-run validation rechecks citations, questions, source integrity, and in
 
 ## History, limits, and recovery
 
-Version-2 runs retain every tool call/result and model item. Checkpoints store only
+Version-3 runs retain every tool call/result and model item. Checkpoints store only
 transcript file references. Orientation's initial profile no longer compacts history.
-The version-2 research transition snapshots the completed checkpoint's history and
+The version-3 research transition snapshots the completed checkpoint's history and
 research instructions, then activates research. Its initial history contains all
 orientation references plus a short transition message. No full profile/question
 snapshot is injected on each request. Research uses its existing separate SQLite
 file and the same run ID; filenames retain stage prefixes and cumulative call IDs.
 A prepared transition resumes idempotently. Active research does not reset budgets.
 
-`tiktoken` 0.14.0 was verified against its official package and model mapping.
-The estimator counts assembled JSON instructions/input/tool definitions, adds 10%
-plus 512 framing tokens, and reserves the output maximum per opaque reasoning
-payload. Ciphertext is not tokenized. It enforces the smaller of the input limit
-and context capacity minus reserved output. Model encoding lookup fails visibly
-when unsupported unless a verified explicit encoding is configured. Capacity is
-configuration, not an automatically inferred model property. Provider usage remains
-authoritative; local estimation cannot guarantee provider context acceptance.
+The complete assembled request is serialized with `json.dumps(ensure_ascii=False,
+separators=(",", ":"))` and measured as UTF-8 bytes. This includes every instruction,
+message, tool call/result, definition, and encrypted reasoning payload. No token
+estimation, output-space reserve, or reasoning reserve is added. The default
+`max_input_bytes` is 1,000,000. `debug/context.json` records `request_bytes` and
+`max_input_bytes`; the dashboard displays “Request size / byte limit”. This is an
+application payload-size limit, not a model context guarantee. API response usage
+remains the only source of token metrics. Over-limit requests stop before reserving
+a model call; provider context-limit failures follow the existing incomplete-run
+error path with history and progress preserved.
 
 Model and page reservations are durable before provider calls. Existing saved
 responses/results/captures are reused after interruption. Crashes between a paid
@@ -64,7 +71,7 @@ exhaustion, corruption, and provider errors preserve incomplete work. Correctabl
 tool input errors return to the model within the remaining allowance.
 
 Legacy run versions are rejected before parsing their old settings or executing
-frozen prompts. No data migration, reset, or byte-to-token reinterpretation occurs.
+frozen prompts. No data migration, reset, or token-to-byte reinterpretation occurs.
 The dashboard reads raw saved metadata so legacy artifacts remain viewable.
 
 ## Dashboard
@@ -74,9 +81,13 @@ The dashboard reads raw saved metadata so legacy artifacts remain viewable.
 blocks DNS rebinding, no CORS is enabled, and no write endpoint exists. Run IDs and
 artifact paths use the existing traversal/symlink protections. Only explicit saved
 artifact types are exposed; credentials, captures, arbitrary debug files, and
-SQLite files are not served. Scraped content is inserted as text, never HTML.
+SQLite files are not served. Scraped content is inserted as text. Profiles use the installed Markdown parser
+with raw HTML disabled and tables enabled; images are replaced with alt text and
+links are restricted to HTTP(S)/mailto. Only this rendered output is inserted as
+HTML; citation buttons are attached to text nodes outside links and code.
 
-The browser polls once a second, preserves tab/filter/expansion/scroll state, and
+The browser schedules its next poll one second after the prior cycle completes,
+uses generation IDs to reject results after run switches (including A → B → A), and preserves tab/filter/expansion/scroll state, and
 follows activity only near its bottom. Source citations select saved sources.
 Metrics reuse response usage and Firecrawl counters; no secondary usage store is
 introduced. Cached and reasoning tokens are displayed as subsets. Missing usage

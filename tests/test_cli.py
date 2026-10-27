@@ -14,7 +14,6 @@ def test_start_and_resume_cli_with_fake_providers(
     monkeypatch.setenv("OPENAI_API_KEY", "fake-openai")
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-firecrawl")
     monkeypatch.setenv("OPENAI_MODEL", "explicit-test-model")
-    monkeypatch.setenv("RESEARCH_ENCODING", "o200k_base")
     inputs = Inputs(
         company="Example",
         product="Widget",
@@ -195,3 +194,46 @@ def test_summary_marks_old_firecrawl_counts_as_unavailable(
     (directory / "debug/firecrawl-counts.json").unlink()
     CLI(directory).summary(directory, "Incomplete")
     assert "earlier Firecrawl calls unavailable" in capsys.readouterr().out
+
+
+def test_byte_limit_settings_and_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    from research_agent.cli import parser
+    from research_agent.storage import Settings
+
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-6-astra")
+    monkeypatch.setenv("RESEARCH_MAX_INPUT_BYTES", "1234567")
+    assert main.environment_settings().max_input_bytes == 1234567
+    assert Settings(model="gpt-6.1-sol").max_input_bytes == 1_000_000
+    args = parser().parse_args(
+        ["research", "--run-id", "test", "--model-calls", "30", "--page-budget", "20"]
+    )
+    assert args.max_input_bytes == 1_000_000
+    assert (
+        parser()
+        .parse_args(["resume", "--run-id", "test", "--max-input-bytes", "2000000"])
+        .max_input_bytes
+        == 2_000_000
+    )
+    with pytest.raises(ValueError):
+        Settings(model="test", max_input_bytes=0)
+
+
+def test_old_token_settings_are_not_reinterpreted_as_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from research_agent.storage import save_json
+
+    monkeypatch.chdir(tmp_path)
+    directory = tmp_path / "data/runs/old_tokens"
+    save_json(
+        directory,
+        "run.json",
+        {
+            "version": 2,
+            "settings": {"input_token_limit": 96000, "encoding": "o200k_base"},
+        },
+    )
+    before = (directory / "run.json").read_bytes()
+    assert main.main(["resume", "--run-id", "old_tokens"]) == 1
+    assert "Legacy runs" in capsys.readouterr().out
+    assert (directory / "run.json").read_bytes() == before

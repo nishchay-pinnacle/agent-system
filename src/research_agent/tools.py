@@ -586,7 +586,28 @@ class OrientationTools:
                     read_json(self.directory, "questions.json")
                 ).questions
             }
+        missing = set(previous) - set(ids)
+        if missing:
+            raise ToolInputError(
+                "Existing questions cannot be removed: "
+                + ", ".join(sorted(missing))
+                + ". Retain each question; for a merge use status merged, merged_into, and closure_reason."
+            )
+        by_id = {q.id: q for q in index.questions}
         for question in index.questions:
+            if question.status == "merged":
+                target = by_id.get(question.merged_into or "")
+                if (
+                    target is None
+                    or target.id == question.id
+                    or target.status == "merged"
+                    or not question.closure_reason
+                ):
+                    raise ToolInputError(
+                        "Merged questions require a distinct, existing non-merged target and closure_reason"
+                    )
+            elif question.merged_into is not None:
+                raise ToolInputError("Only merged questions may have merged_into")
             assessments = (
                 {a.source_id: a for a in previous[question.id].source_assessments}
                 if question.id in previous

@@ -30,7 +30,7 @@ def test_state_events_and_legacy_fields(tmp_path: Path) -> None:
     snapshot = state(directory)
     assert snapshot["questions"]["questions"][0]["id"] == "Q1"
     assert snapshot["sources"][0]["content"]
-    assert snapshot["context"]["estimated_tokens"] > 0
+    assert snapshot["context"]["request_bytes"] > 0
     legacy = tmp_path / "legacy"
     legacy.mkdir()
     save_json(legacy, "run.json", {"version": 1, "settings": {"input_allowance": 1000}})
@@ -77,3 +77,44 @@ def test_http_allowlist_and_rebinding(tmp_path: Path) -> None:
     (directory / "profile.md").symlink_to(tmp_path / "private.txt")
     with pytest.raises(ValueError, match="no symlinks"):
         state(directory)
+
+
+def test_markdown_profile_renders_structure_without_executable_html(
+    tmp_path: Path,
+) -> None:
+    from bs4 import BeautifulSoup
+
+    from research_agent.dashboard import render_profile
+
+    content = """# Profile
+
+**Strong** and *emphasis* [S1].
+
+- First
+- Second
+
+| Feature | Evidence |
+| --- | --- |
+| Export | [S2] |
+
+[Vendor](https://example.com/) [Bad](javascript:alert(1))
+<script>alert('x')</script><img src=x onerror=alert(1)>
+
+![Remote image](https://example.com/tracker)
+"""
+    rendered = render_profile(content)
+    soup = BeautifulSoup(rendered, "html.parser")
+    assert soup.find("h1").text == "Profile"
+    assert soup.find("strong").text == "Strong" and soup.find("em").text == "emphasis"
+    assert len(soup.find_all("li")) == 2
+    assert soup.find("table") and soup.find("td").text == "Export"
+    assert soup.find("a")["href"] == "https://example.com/"
+    assert "[S1]" in soup.text and "[S2]" in soup.text
+    assert not soup.find_all(["script", "img"])
+    assert all(
+        not str(a.get("href", "")).startswith("javascript:") for a in soup.find_all("a")
+    )
+    directory, _, _, _ = setup_run(tmp_path)
+    save_json(directory, "run.json", {"version": 2})
+    (directory / "profile.md").write_text(content)
+    assert state(directory)["profile_html"] == rendered

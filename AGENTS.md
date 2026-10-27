@@ -10,7 +10,7 @@ external search, PDF/media processing,
 approval flows, queues, services or a memory framework without a new request.
 
 Continue a completed orientation explicitly:
-`uv run python -m research_agent.main research --run-id orientation_YOUR_RUN_ID --model-calls 30 --page-budget 20 --input-token-limit 96000`.
+`uv run python -m research_agent.main research --run-id orientation_YOUR_RUN_ID --model-calls 30 --page-budget 20 --max-input-bytes 1000000`.
 Resume either stage with `uv run python -m research_agent.main resume --run-id orientation_YOUR_RUN_ID`.
 Research allowances are additional at transition; resume overrides are total ceilings.
 

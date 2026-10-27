@@ -127,3 +127,49 @@ def test_firecrawl_sdk_scrape_map_options_and_capture_fields(
     assert entries[0].description == "API"
     assert sent[1]["sitemap"] == "include" and sent[1]["includeSubdomains"] is True
     assert sent[1]["limit"] == 5000
+
+
+def test_provider_context_error_preserves_progress_and_resume(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_orientation import FakeModel, FakePages, execute, setup_run
+
+    from research_agent.storage import Run, read_json
+
+    directory, run, model, pages = setup_run(tmp_path, max_model_calls=3)
+    with pytest.raises(ValueError, match="limit exhausted"):
+        execute(directory, run, model, pages)
+    before = (directory / "profile.md").read_bytes()
+    run.settings.max_model_calls = 8
+    sent = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(request.content)
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Context window exceeded",
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                }
+            },
+        )
+
+    def client(**kwargs: object) -> OpenAI:
+        return OpenAI(
+            api_key="fake",
+            http_client=httpx.Client(transport=httpx.MockTransport(respond)),
+            max_retries=0,
+        )
+
+    monkeypatch.setattr(agent, "OpenAI", client)
+    with pytest.raises(RuntimeError, match="Input was not truncated"):
+        execute(directory, run, OpenAIModel("fake", 12), FakePages())
+    assert run.status == "incomplete" and run.model_calls == 4
+    assert (directory / "profile.md").read_bytes() == before
+    assert read_json(directory, "debug/context.json")["request_bytes"] == len(sent[0])
+    reopened = Run.model_validate(read_json(directory, "run.json"))
+    fresh_pages = FakePages()
+    execute(directory, reopened, FakeModel(run.inputs), fresh_pages)
+    assert reopened.status == "complete" and not fresh_pages.scraped

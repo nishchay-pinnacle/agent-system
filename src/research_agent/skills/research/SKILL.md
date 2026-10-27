@@ -7,7 +7,11 @@ Continue as the same single agent. Review and order the saved questions initiall
 Select important open questions that materially improve understanding or unlock
 other answers. Save the active question with update_questions before investigating.
 Reassess priorities as evidence arrives; reorder, add, refine, merge, reopen, or
-switch questions when appropriate. Keep stable IDs for retained questions.
+switch questions when appropriate. Keep every existing ID in each full update.
+For a merge, retain the original question with status merged, merged_into set to a
+distinct non-merged question ID, and closure_reason explaining the merge. Preserve
+its evidence and carry relevant findings into the surviving question. Resolve the
+surviving question before finishing; never silently drop unresolved questions.
 
 The active question guides source selection; it does not restrict what the agent
 can learn. After reading a source, consider its implications for all questions.

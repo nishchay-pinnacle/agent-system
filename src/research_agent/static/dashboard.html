@@ -3,11 +3,12 @@
 <title>Research notebook</title>
 <style>
 :root{font:15px/1.6 system-ui;color:#243447;background:#f4f6f8}*{box-sizing:border-box}body{margin:0}header{height:80px;background:#142d40;color:white;display:flex;align-items:center;justify-content:space-between;padding:20px 28px}h1{font-size:21px;margin:0}small{color:#aac4d3}select,button{font:inherit;padding:7px 12px;border:1px solid #cbd6de;border-radius:7px;background:white;color:#243447}main{display:grid;grid-template-columns:42% 58%;height:calc(100vh - 80px)}section{overflow:auto;padding:24px}#activity{border-right:1px solid #d6dfe5}h2{font-size:15px;text-transform:uppercase;letter-spacing:.09em;color:#617787;margin:0 0 16px}details,.card{background:white;border:1px solid #dce3e8;border-radius:9px;padding:14px;margin-bottom:12px}summary{cursor:pointer;font-weight:600}pre{overflow:auto;max-height:400px;font:12px/1.6 ui-monospace,monospace;white-space:pre}p{white-space:pre-wrap}nav{display:flex;gap:8px;position:sticky;top:-24px;background:#f4f6f8;padding:15px 0;z-index:1}button.active{background:#176b75;color:white}.active-question{border-left:4px solid #13998c}#metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:15px}.metric{background:white;padding:12px;border-radius:8px;font-size:12px;color:#617787}.metric strong{display:block;font-size:17px;color:#243447}.pill{font-size:12px;color:#176b75;margin-left:8px}.citation{font:inherit;border:0;background:#e0f1f0;color:#09665e;padding:0 3px;cursor:pointer}.chart{display:flex;align-items:end;gap:4px;height:65px;margin:12px 0 24px}.bar{background:#227d88;min-width:8px;flex:1;max-width:24px}.bar span{display:block;background:#9dcfd0}a{color:#176b75}#error{color:#b23636}article{overflow-wrap:anywhere}#filter{margin:0 0 14px}time{color:#718491;font-size:11px;display:block}@media(max-width:800px){main{grid-template-columns:1fr;height:auto}section{height:70vh}header{height:auto;gap:12px;flex-wrap:wrap}#metrics{grid-template-columns:repeat(2,1fr)}}
+table{border-collapse:collapse;display:block;overflow:auto}th,td{border:1px solid #cbd6de;padding:8px 12px}#content p{white-space:normal}#content li{margin:4px 0}
 </style>
 <header><div><h1>Research notebook</h1><small>Local evidence · read-only · updates every second</small></div><select id="runs" aria-label="Select run"></select></header>
-<main><section id="activity"><h2>Live activity</h2><div id="events"></div></section><section id="workspace"><div id="error"></div><h2>Run overview</h2><div id="metrics"></div><div id="chart" class="chart" aria-label="Per-call reported tokens"></div><nav><button data-tab="questions" class="active">Questions</button><button data-tab="profile">Profile</button><button data-tab="sources">Sources</button></nav><select id="filter" aria-label="Question status"><option value="open">Open questions</option><option value="answered">Answered</option><option value="needs_interview">Interview questions</option><option value="all">All questions</option></select><article id="content"></article></section></main>
+<main><section id="activity"><h2>Live activity</h2><div id="events"></div></section><section id="workspace"><div id="error"></div><h2>Run overview</h2><div id="metrics"></div><div id="chart" class="chart" aria-label="Per-call reported tokens"></div><nav><button data-tab="questions" class="active">Questions</button><button data-tab="profile">Profile</button><button data-tab="sources">Sources</button></nav><select id="filter" aria-label="Question status"><option value="open">Open questions</option><option value="answered">Answered</option><option value="needs_interview">Interview questions</option><option value="merged">Merged questions</option><option value="all">All questions</option></select><article id="content"></article></section></main>
 <script>
-const $=id=>document.getElementById(id);let run='',offset=0,tab='questions',data={},last='',expanded=new Set();
+const $=id=>document.getElementById(id);let run='',offset=0,tab='questions',data={},last='',expanded=new Set(), generation=0;
 const el=(tag,text,cls)=>{let n=document.createElement(tag);if(text!=null)n.textContent=text;if(cls)n.className=cls;return n};
 function cite(node,text){for(let part of String(text??'Unavailable').split(/(\[S\d+\])/)){if(/^\[S\d+\]$/.test(part)){let b=el('button',part,'citation');b.onclick=()=>{tab='sources';expanded.add(part.slice(1,-1));render();$(part.slice(1,-1))?.scrollIntoView({block:'center'})};node.append(b)}else node.append(document.createTextNode(part))}}
 function detail(key,title,body){let d=el('details');d.id=key;d.open=expanded.has(key);d.append(el('summary',title));body(d);d.ontoggle=()=>{d.open?expanded.add(key):expanded.delete(key)};return d}
@@ -17,16 +18,62 @@ metric('Stage / status',`${r.stage??'Unavailable'} · ${r.status??'Unavailable'}
 const sum=key=>calls.length&&calls.every(c=>Number.isInteger(c?.[key]))?calls.reduce((a,c)=>a+c[key],0):null;
 metric('Input / output tokens',sum('input_tokens')==null||sum('output_tokens')==null?null:`${sum('input_tokens')} / ${sum('output_tokens')}`);
 for(let [label,field,key] of [['Cached input (subset)','input_tokens_details','cached_tokens'],['Reasoning output (subset)','output_tokens_details','reasoning_tokens']])metric(label,calls.length&&calls.every(c=>Number.isInteger(c?.[field]?.[key]))?calls.reduce((a,c)=>a+c[field][key],0):null);
-metric('Scrape / map calls',data.firecrawl?.complete_history?`${data.firecrawl.scrape} / ${data.firecrawl.map}`:null);metric('Research pages',r.research_page_budget==null?null:`${r.research_page_attempts??'?'} / ${r.research_page_budget}`);metric('Estimated input / capacity',data.context?`${data.context.estimated_tokens} / ${s.context_tokens??'?'}`:null);
+metric('Scrape / map calls',data.firecrawl?.complete_history?`${data.firecrawl.scrape} / ${data.firecrawl.map}`:null);metric('Research pages',r.research_page_budget==null?null:`${r.research_page_attempts??'?'} / ${r.research_page_budget}`);metric('Request size / byte limit',data.context?.request_bytes!=null?`${data.context.request_bytes} / ${s.max_input_bytes??'?'}`:null);
 $('chart').replaceChildren();let max=Math.max(1,...calls.map(c=>(c?.input_tokens??0)+(c?.output_tokens??0)));calls.forEach((c,i)=>{let b=el('div',null,'bar'),total=(c?.input_tokens??0)+(c?.output_tokens??0);b.style.height=`${total/max*100}%`;b.title=`Call ${i+1}: ${c?.input_tokens??'unavailable'} input / ${c?.output_tokens??'unavailable'} output`;let o=el('span');o.style.height=`${(c?.output_tokens??0)/Math.max(1,total)*100}%`;b.append(o);$('chart').append(b)});
 document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));$('filter').hidden=tab!=='questions';$('content').replaceChildren();
-if(tab==='questions'){let index=data.questions;if(!index){$('content').append(el('p','Question index unavailable for this run.'));}else{let qs=index.questions.filter(q=>$('filter').value==='all'||q.status===$('filter').value);if(!qs.length)$('content').append(el('p','No questions in this view.'));qs.forEach(q=>{let d=detail(q.id,q.question,n=>{n.append(el('p',q.priority_reason));let p=el('p');cite(p,q.answer);n.append(p);n.append(el('p',`Basis: ${q.answer_basis??'unavailable'} · ${q.status}`));let streak=0;for(let a of q.source_assessments??[])streak=a.useful?0:streak+1;n.append(el('p',`Consecutive unproductive pages: ${streak}`));for(let a of q.source_assessments??[]){let p=el('p');cite(p,`[${a.source_id}] — ${a.useful?'Useful evidence':'Relevant, no progress'}`);n.append(p)}if(q.closure_reason)n.append(el('p',q.closure_reason))});if(q.id===index.active_question_id){d.classList.add('active-question');d.querySelector('summary').append(el('span','Active','pill'))}$('content').append(d)})}}
-if(tab==='profile'){for(let line of (data.profile??'Profile unavailable.').split('\n')){let heading=line.match(/^(#{1,6})\s+(.*)$/),n=el(heading?'h'+heading[1].length:'p');cite(n,heading?heading[2]:line);$('content').append(n)}}
+if(tab==='questions'){let index=data.questions;if(!index){$('content').append(el('p','Question index unavailable for this run.'));}else{let qs=index.questions.filter(q=>$('filter').value==='all'||q.status===$('filter').value);if(!qs.length)$('content').append(el('p','No questions in this view.'));qs.forEach(q=>{let d=detail(q.id,q.question,n=>{n.append(el('p',q.priority_reason));let p=el('p');cite(p,q.answer);n.append(p);n.append(el('p',`Basis: ${q.answer_basis??'unavailable'} · ${q.status}`));let streak=0;for(let a of q.source_assessments??[])streak=a.useful?0:streak+1;n.append(el('p',`Consecutive unproductive pages: ${streak}`));for(let a of q.source_assessments??[]){let p=el('p');cite(p,`[${a.source_id}] — ${a.useful?'Useful evidence':'Relevant, no progress'}`);n.append(p)}if(q.closure_reason)n.append(el('p',q.closure_reason));if(q.merged_into)n.append(el('p',`Merged into ${q.merged_into}`))});if(q.id===index.active_question_id){d.classList.add('active-question');d.querySelector('summary').append(el('span','Active','pill'))}$('content').append(d)})}}
+if(tab==='profile'){
+  // HTML comes only from the server's raw-HTML-disabled Markdown renderer.
+  $('content').innerHTML=data.profile_html??'<p>Profile unavailable.</p>';
+  const walker=document.createTreeWalker($('content'),NodeFilter.SHOW_TEXT);
+  const nodes=[];
+  while(walker.nextNode()) if(!walker.currentNode.parentElement.closest('a,code,pre') && /\[S\d+\]/.test(walker.currentNode.textContent)) nodes.push(walker.currentNode);
+  for(const node of nodes){let span=el('span');cite(span,node.textContent);node.replaceWith(span)}
+}
 if(tab==='sources'){for(let source of data.sources??[]){$('content').append(detail(source.id,`${source.id} · ${source.title||source.url}`,n=>{try{let url=new URL(source.url);if(['http:','https:'].includes(url.protocol)){let a=el('a',source.url);a.href=url.href;a.target='_blank';a.rel='noopener noreferrer';n.append(a)}}catch{}n.append(el('p',source.content))}))}}
 $('workspace').scrollTop=top;
 }
-async function poll(){if(!run)return;try{let current=run;let [s,e]=await Promise.all([fetch('/api/state?run='+encodeURIComponent(run)).then(r=>{if(!r.ok)throw Error('Run artifacts unavailable');return r.json()}),fetch(`/api/events?run=${encodeURIComponent(run)}&offset=${offset}`).then(r=>r.json())]);if(current!==run)return;let signature=JSON.stringify(s);data=s;if(signature!==last){last=signature;render()}let pane=$('activity'),follow=pane.scrollHeight-pane.scrollTop-pane.clientHeight<45;for(let event of e.events){let d=el('details');d.append(el('summary',`${event.kind} · ${event.name}`),el('time',event.time),el('pre',JSON.stringify(event.details,null,2)));$('events').append(d)}offset=e.offset;if(follow)pane.scrollTop=pane.scrollHeight;$('error').textContent=''}catch(e){$('error').textContent=e.message}}
-$('runs').onchange=()=>{run=$('runs').value;offset=0;last='';expanded.clear();$('events').replaceChildren();poll()};$('filter').onchange=render;document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{tab=b.dataset.tab;render()});
-async function refreshRuns(){let d=await fetch('/api/runs').then(r=>r.json());for(let id of d.runs)if(![...$('runs').options].some(o=>o.value===id)){let o=el('option',id);o.value=id;$('runs').append(o)}if(!run&&d.runs.length){$('runs').value=d.selected||d.runs.at(-1);$('runs').onchange()}}
-refreshRuns();setInterval(async()=>{await refreshRuns();await poll()},1000);
+async function fetchJSON(url){
+  const response=await fetch(url,{signal:AbortSignal.timeout(15000)});
+  if(!response.ok) throw Error('Run artifacts unavailable');
+  return response.json();
+}
+async function poll(){
+  if(!run)return;
+  const current=generation, selected=run;
+  // Sequential fetches also ensure failure cannot leave a sibling fetch pending.
+  const s=await fetchJSON('/api/state?run='+encodeURIComponent(selected));
+  if(current!==generation)return;
+  const e=await fetchJSON(`/api/events?run=${encodeURIComponent(selected)}&offset=${offset}`);
+  if(current!==generation)return;
+  const signature=JSON.stringify(s);data=s;
+  if(signature!==last){last=signature;render()}
+  const pane=$('activity'),follow=pane.scrollHeight-pane.scrollTop-pane.clientHeight<45;
+  for(const event of e.events){
+    const d=el('details');
+    d.append(el('summary',`${event.kind} · ${event.name}`),el('time',event.time),el('pre',JSON.stringify(event.details,null,2)));
+    $('events').append(d);
+  }
+  offset=e.offset;
+  if(follow)pane.scrollTop=pane.scrollHeight;
+}
+$('runs').onchange=()=>{
+  generation++;run=$('runs').value;offset=0;last='';data={};expanded.clear();
+  $('events').replaceChildren();render();
+};
+$('filter').onchange=render;
+document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{tab=b.dataset.tab;render()});
+async function refreshRuns(){
+  const d=await fetchJSON('/api/runs');
+  for(const id of d.runs)if(![...$('runs').options].some(o=>o.value===id)){
+    const o=el('option',id);o.value=id;$('runs').append(o);
+  }
+  if(!run&&d.runs.length){$('runs').value=d.selected||d.runs.at(-1);$('runs').onchange()}
+}
+async function tick(){
+  try{await refreshRuns();await poll();$('error').textContent=''}
+  catch(error){$('error').textContent=error.message}
+  finally{setTimeout(tick,1000)}
+}
+tick();
 </script></html>
