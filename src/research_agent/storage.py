@@ -193,3 +193,52 @@ def record_firecrawl_call(directory: Path, operation: Literal["scrape", "map"]) 
         counts.map += 1
     # Reserve before calling so failed requests also count across resume.
     save_json(directory, "debug/firecrawl-counts.json", counts.model_dump())
+
+
+ORIENTATION_SNAPSHOT = "context/initial-profile.v1.json"
+ORIENTATION_RECEIPT = (
+    "Both starting-page inputs have been processed and the initial profile saved. "
+    "Remaining orientation work: build the company site index, then stop."
+)
+
+
+class OrientationSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    version: Literal[1] = 1
+    profile: str = Field(min_length=1)
+    sources: list[str] = Field(min_length=1)
+    receipt: str
+
+
+def load_orientation_snapshot(
+    directory: Path, reference: str, inputs: Inputs
+) -> OrientationSnapshot:
+    if reference != ORIENTATION_SNAPSHOT:
+        raise ValueError(
+            "Unsupported orientation snapshot reference; preserve run files"
+        )
+    saved = read_json(directory, reference)
+    if saved.get("version") != 1:
+        raise ValueError("Unsupported orientation snapshot version; preserve run files")
+    snapshot = OrientationSnapshot.model_validate(saved)
+    if (
+        snapshot.sources != [f"sources/{source_id(url)}.md" for url in inputs.urls]
+        or snapshot.receipt != ORIENTATION_RECEIPT
+    ):
+        raise ValueError(
+            "Invalid orientation snapshot sources or receipt; restore run files"
+        )
+    return snapshot
+
+
+def save_orientation_snapshot(directory: Path, inputs: Inputs) -> str:
+    # A replay selects the first durable snapshot, never the mutable profile again.
+    if not local_path(directory, ORIENTATION_SNAPSHOT).exists():
+        snapshot = OrientationSnapshot(
+            profile=local_path(directory, "profile.md").read_bytes().decode("utf-8"),
+            sources=[f"sources/{source_id(url)}.md" for url in inputs.urls],
+            receipt=ORIENTATION_RECEIPT,
+        )
+        save_json(directory, ORIENTATION_SNAPSHOT, snapshot.model_dump())
+    load_orientation_snapshot(directory, ORIENTATION_SNAPSHOT, inputs)
+    return ORIENTATION_SNAPSHOT

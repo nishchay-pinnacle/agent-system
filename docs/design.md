@@ -43,8 +43,32 @@ contract and integration tests were rebuilt for this smaller scope.
 ## Checkpoint and failure semantics
 
 SQLite uses the run ID as LangGraph's thread ID. Graph state contains transcript
-file references and a turn counter, not entire research outputs. Full model input
-is reconstructed from saved records with no custom compaction or truncation.
+file references and a turn counter, not entire research outputs. Before the first
+successful profile save, active context contains the complete starting-page tool
+results. That save is the sole compaction boundary: after validating both sources,
+the runtime atomically writes `context/initial-profile.v1.json` with version 1,
+the exact saved profile, source references and a deterministic progress receipt.
+It then checkpoints this snapshot reference as `baseline` and clears active
+`history`. No model call is used for compaction.
+
+The next request contains the unchanged system/skill, original user request,
+tool definitions/settings, and one assistant message containing the snapshot.
+Superseded tool exchanges and reasoning items are absent; new exchanges accumulate
+after the baseline. The full original requests, responses, tool results and sources
+remain archived unchanged. The existing input allowance checks the rebuilt request;
+there is no truncation.
+
+The snapshot has a stable run-local name and is never regenerated from a later edit
+to `profile.md`. It is saved before its checkpoint reference, so boundary replay
+reuses the same snapshot and saved successful tool result. Rejected or failed
+profile saves do not compact. Missing/invalid selected snapshots pause recovery;
+unsupported snapshot versions are rejected explicitly.
+
+Older orientation checkpoints lacking `baseline` keep their original history.
+A pending successful profile tool can establish the new boundary; checkpoints
+already past that save continue unmodified without retroactive compaction. There
+is no reset or migration of original transcripts. Pre-rebuild legacy jobs remain
+unsupported as before.
 Model requests and raw responses are saved before tools execute; successful tool
 results are saved before their checkpoint. A cached model response prevents
 regenerating a pending tool request on resume. Captures and the index are reused
@@ -82,7 +106,10 @@ of unused tokenization dependencies.
 - [OpenAI function calling](https://developers.openai.com/api/docs/guides/function-calling):
   Responses input/output items, strict tools, required tool choice, one tool per
   turn, and reasoning item replay. The installed SDK's typed request adapter and
-  mocked HTTP test verify the actual request shape.
+  mocked HTTP test verify the actual request shape. The [conversation state guide](https://developers.openai.com/api/docs/guides/conversation-state)
+  and installed `EasyInputMessageParam` confirm ordinary user/assistant text inputs;
+  the snapshot starts a fresh input rather than replaying incomplete tool pairs.
+  Compaction tests validate each rebuilt request against the installed SDK.
 - [Firecrawl Python SDK](https://github.com/firecrawl/firecrawl/blob/main/apps/python-sdk/README.md):
   installed `FirecrawlClient.scrape`/`map` signatures and source were inspected for
   formats, `sitemap="include"`, `include_subdomains=True`, millisecond server

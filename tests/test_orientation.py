@@ -8,6 +8,7 @@ from pydantic import JsonValue
 
 from research_agent.agent import initialize_prompts, run_agent
 from research_agent.storage import (
+    ORIENTATION_SNAPSHOT,
     Inputs,
     Run,
     Settings,
@@ -63,7 +64,17 @@ class FakeModel:
             isinstance(item, dict) and item.get("type") == "function_call_output"
             for item in items
         )
-        if completed < len(self.inputs.urls):
+        compacted = any(
+            isinstance(item, dict)
+            and item.get("role") == "assistant"
+            and str(item.get("content", "")).startswith(
+                "Both starting-page inputs have been processed and the initial profile saved."
+            )
+            for item in items
+        )
+        if compacted:
+            name, arguments = "build_site_index", {"site_url": self.inputs.site_url}
+        elif completed < len(self.inputs.urls):
             name, arguments = "read_page", {"url": self.inputs.urls[completed]}
         elif completed == len(self.inputs.urls):
             name = "update_profile"
@@ -435,6 +446,7 @@ def test_rejected_profile_can_be_corrected_after_resume(
     if budget == 3:
         with pytest.raises(ValueError, match="limit exhausted"):
             execute(directory, run, model, pages)
+        assert not (directory / ORIENTATION_SNAPSHOT).exists()
         assert not (directory / "profile.md").exists()
         run = Run.model_validate(read_json(directory, "run.json"))
         run.settings.max_model_calls = 5

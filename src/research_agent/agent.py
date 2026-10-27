@@ -3,7 +3,7 @@
 import json
 from importlib.resources import files
 from pathlib import Path
-from typing import Protocol, TypedDict
+from typing import NotRequired, Protocol, TypedDict
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -16,11 +16,14 @@ from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from research_agent.cli import CLI
 from research_agent.storage import (
+    JSON_OBJECT,
     FirecrawlCounts,
     Run,
+    load_orientation_snapshot,
     local_path,
     read_json,
     save_json,
+    save_orientation_snapshot,
     save_run,
     write_text,
 )
@@ -61,6 +64,7 @@ class OpenAIModel:
 class State(TypedDict):
     history: list[str]
     turn: int
+    baseline: NotRequired[str]
 
 
 def initialize_prompts(directory: Path, run: Run) -> None:
@@ -114,6 +118,23 @@ def run_agent(
         request_name = f"debug/turn-{turn:04d}.request.json"
         if not local_path(directory, response_name).exists():
             items: list[dict[str, JsonValue]] = []
+            if baseline := state.get("baseline"):
+                snapshot = load_orientation_snapshot(directory, baseline, run.inputs)
+                items.extend(
+                    JSON_ITEMS.validate_python(
+                        read_json(directory, "user.json")["items"]
+                    )
+                )
+                items.append(
+                    {
+                        "role": "assistant",
+                        "content": snapshot.receipt
+                        + "\n\nStarting sources:\n"
+                        + "\n".join(snapshot.sources)
+                        + "\n\nSaved initial profile:\n"
+                        + snapshot.profile,
+                    }
+                )
             for reference in state["history"]:
                 saved_items = JSON_ITEMS.validate_python(
                     read_json(directory, reference)["items"]
@@ -215,6 +236,21 @@ def run_agent(
             )
         else:
             display.event("Tool", str(name), {"Status": "Reusing saved result"})
+            saved_items = JSON_ITEMS.validate_python(
+                read_json(directory, result_name)["items"]
+            )
+            result = JSON_OBJECT.validate_json(str(saved_items[0]["output"]))
+        if (
+            name == "update_profile"
+            and result.get("saved") is True
+            and not state.get("baseline")
+        ):
+            if not tools.pages_read():
+                raise ValueError(
+                    "Cannot snapshot orientation without both starting sources"
+                )
+            baseline = save_orientation_snapshot(directory, run.inputs)
+            return {"history": [], "turn": state["turn"] + 1, "baseline": baseline}
         return {"history": state["history"] + [result_name], "turn": state["turn"] + 1}
 
     def route(state: State) -> str:
@@ -238,6 +274,8 @@ def run_agent(
         with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
             compiled = graph.compile(checkpointer=saver)
             snapshot = compiled.get_state(config)
+            if baseline := snapshot.values.get("baseline"):
+                load_orientation_snapshot(directory, baseline, run.inputs)
             if snapshot.values and not snapshot.next:
                 if not tools.complete():
                     raise ValueError(
