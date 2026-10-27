@@ -70,6 +70,7 @@ def test_openai_sdk_sends_exact_model_and_tools(
         "read_page",
         "update_profile",
         "build_site_index",
+        "update_questions",
     }
 
 

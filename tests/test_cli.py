@@ -14,6 +14,7 @@ def test_start_and_resume_cli_with_fake_providers(
     monkeypatch.setenv("OPENAI_API_KEY", "fake-openai")
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-firecrawl")
     monkeypatch.setenv("OPENAI_MODEL", "explicit-test-model")
+    monkeypatch.setenv("RESEARCH_ENCODING", "o200k_base")
     inputs = Inputs(
         company="Example",
         product="Widget",
@@ -52,13 +53,13 @@ def test_start_and_resume_cli_with_fake_providers(
     assert "Unavailable from provider" in output
     assert "action=" not in output
     assert "Run summary · Complete" in output
-    assert "Model requests: 4" in output
+    assert "Model requests: 5" in output
     assert "Firecrawl requests: 2 scrape · 1 map" in output
-    assert "Total API requests: 7" in output
+    assert "Total API requests: 8" in output
     requests = len(model.requests)
     assert main.main(["resume", "--run-id", directory.name]) == 0
     assert len(model.requests) == requests
-    assert "Total API requests: 7" in capsys.readouterr().out
+    assert "Total API requests: 8" in capsys.readouterr().out
     assert (
         read_json(directory, "run.json")["settings"]["model"] == "explicit-test-model"
     )
@@ -169,16 +170,16 @@ def test_summary_keeps_failed_requests_and_usage_across_resume(
     CLI(directory).summary(directory, "Incomplete")
     output = capsys.readouterr().out
     assert "Run summary · Incomplete" in output
-    assert "Total tokens (reported): 480" in output
-    assert "Input / output tokens: 400 / 80" in output
-    assert "Total API requests: 7" in output
+    assert "Total tokens (reported): 600" in output
+    assert "Input / output tokens: 500 / 100" in output
+    assert "Total API requests: 8" in output
     reopened = Run.model_validate(read_json(directory, "run.json"))
     execute(directory, reopened, FakeModel(run.inputs), FakePages())
     CLI(directory).summary(directory, "Complete")
     output = capsys.readouterr().out
-    assert "Total tokens (reported): 480" in output
+    assert "Total tokens (reported): 600" in output
     assert "Firecrawl requests: 2 scrape · 2 map" in output
-    assert "Total API requests: 8" in output
+    assert "Total API requests: 9" in output
 
 
 def test_summary_marks_old_firecrawl_counts_as_unavailable(

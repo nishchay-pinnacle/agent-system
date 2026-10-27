@@ -4,13 +4,13 @@
 
 This project is one local company research agent with orientation and explicit HTML
 research stages, runtime-loaded skills, LangGraph SQLite checkpoints and run-local
-files. Keep orientation-only start/resume available. Orientation compacts once at
-the initial profile save; research retains every exchange without compaction or
-truncation. Do not add subagents, external search, PDF/media processing, dashboards,
+files. Keep orientation-only start/resume available. Both stages retain every exchange across handoff and resume without compaction or
+truncation. Keep the read-only localhost dashboard lightweight. Do not add subagents,
+external search, PDF/media processing,
 approval flows, queues, services or a memory framework without a new request.
 
 Continue a completed orientation explicitly:
-`uv run python -m research_agent.main research --run-id orientation_YOUR_RUN_ID --model-calls 30 --page-budget 20 --input-allowance 160000`.
+`uv run python -m research_agent.main research --run-id orientation_YOUR_RUN_ID --model-calls 30 --page-budget 20 --input-token-limit 96000`.
 Resume either stage with `uv run python -m research_agent.main resume --run-id orientation_YOUR_RUN_ID`.
 Research allowances are additional at transition; resume overrides are total ceilings.
 

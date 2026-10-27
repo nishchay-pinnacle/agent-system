@@ -54,9 +54,10 @@ def providers(
     monkeypatch.setenv("OPENAI_API_KEY", "fake")
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fake")
     monkeypatch.setenv("OPENAI_MODEL", "explicit-test-model")
+    monkeypatch.setenv("RESEARCH_ENCODING", "o200k_base")
     monkeypatch.setenv("RESEARCH_DATA_DIR", "data")
-    monkeypatch.setenv("RESEARCH_MAX_MODEL_CALLS", "4")
-    monkeypatch.setenv("RESEARCH_INPUT_ALLOWANCE", "96000")
+    monkeypatch.setenv("RESEARCH_MAX_MODEL_CALLS", "5")
+    monkeypatch.setenv("RESEARCH_INPUT_TOKEN_LIMIT", "96000")
     model, pages = WorkflowModel(), FakePages()
     monkeypatch.setattr(main, "OpenAIModel", lambda key, timeout: model)
     monkeypatch.setattr(main, "FirecrawlPages", lambda key, settings: pages)
@@ -77,7 +78,7 @@ def test_start_runs_both_stages_and_persists_research_allowances(
             "8",
             "--page-budget",
             "3",
-            "--input-allowance",
+            "--input-token-limit",
             "180000",
             "--index-result-limit",
             "7",
@@ -91,26 +92,26 @@ def test_start_runs_both_stages_and_persists_research_allowances(
     assert run.stage == "research" and run.status == "complete"
     assert run.workflow_intent is not None and run.workflow_intent.full_workflow
     assert run.workflow_intent.model_calls == (8 if custom else 30)
-    assert run.settings.max_model_calls == (12 if custom else 34)
-    assert run.settings.input_allowance == (180000 if custom else 160000)
+    assert run.settings.max_model_calls == (13 if custom else 35)
+    assert run.settings.input_token_limit == (180000 if custom else 96000)
     assert run.settings.index_result_limit == (7 if custom else 20)
     assert run.research_page_budget == (3 if custom else 20)
-    assert run.research_page_attempts == 1 and run.model_calls == 6
+    assert run.research_page_attempts == 1 and run.model_calls == 7
     original = read_json(directory, RESEARCH_START)["original_run"]
-    assert original["settings"]["max_model_calls"] == 4
-    assert original["settings"]["input_allowance"] == 96000
-    assert len(model.orientation.requests) == 4 and len(model.research.requests) == 2
+    assert original["settings"]["max_model_calls"] == 5
+    assert original["settings"]["input_token_limit"] == 96000
+    assert len(model.orientation.requests) == 5 and len(model.research.requests) == 2
     assert len(pages.scraped) == 3 and pages.mapped == [INPUTS.site_url]
     output = capsys.readouterr().out
     assert "Orientation complete — continuing to research" in output
     assert "Complete · Orientation complete" not in output
     assert "Complete · Research complete" in output
     assert output.count("Run summary · Complete") == 1
-    assert "Model requests: 6" in output and "Total API requests: 10" in output
+    assert "Model requests: 7" in output and "Total API requests: 11" in output
     assert "Total tokens (reported): 240" in output
     # A completed full workflow may be reopened without any additional calls.
     assert main.main(["resume", "--run-id", directory.name]) == 0
-    assert len(model.orientation.requests) == 4 and len(model.research.requests) == 2
+    assert len(model.orientation.requests) == 5 and len(model.research.requests) == 2
     assert len(pages.scraped) == 3 and len(pages.mapped) == 1
 
 
@@ -127,7 +128,7 @@ def test_orientation_only_remains_orientation_on_resume(
     assert run.stage == "orientation" and run.status == "complete"
     assert not (directory / RESEARCH_START).exists()
     assert main.main(["resume", "--run-id", directory.name]) == 0
-    assert not model.research.requests and len(model.orientation.requests) == 4
+    assert not model.research.requests and len(model.orientation.requests) == 5
     # Explicit extension is still available for these runs.
     assert (
         main.main(
@@ -139,7 +140,7 @@ def test_orientation_only_remains_orientation_on_resume(
                 "5",
                 "--page-budget",
                 "2",
-                "--input-allowance",
+                "--input-token-limit",
                 "160000",
             ]
         )
@@ -172,12 +173,12 @@ def test_orientation_failure_stops_then_fresh_resume_continues_workflow(
     monkeypatch.setattr(main, "OpenAIModel", lambda key, timeout: fresh_model)
     monkeypatch.setattr(main, "FirecrawlPages", lambda key, settings: fresh_pages)
     assert (
-        main.main(["resume", "--run-id", directory.name, "--max-model-calls", "4"]) == 0
+        main.main(["resume", "--run-id", directory.name, "--max-model-calls", "5"]) == 0
     )
     run = Run.model_validate(read_json(directory, "run.json"))
     assert run.stage == "research" and run.status == "complete"
-    assert run.settings.max_model_calls == 34 and run.model_calls == 6
-    assert len(fresh_model.orientation.requests) == (0 if failure == "map" else 3)
+    assert run.settings.max_model_calls == 35 and run.model_calls == 7
+    assert len(fresh_model.orientation.requests) == (0 if failure == "map" else 4)
     assert len(fresh_pages.scraped) == (1 if failure == "map" else 2)
 
 
@@ -211,14 +212,24 @@ def test_fresh_resume_across_automatic_handoff(
             patch.setattr(main, "begin_research", interrupted_begin)
         assert main.main(START) == 1
     directory = next((tmp_path / "data/runs").iterdir())
-    assert len(model.orientation.requests) == 4 and not model.research.requests
+    assert len(model.orientation.requests) == 5 and not model.research.requests
     output = capsys.readouterr().out
     assert "Research incomplete" in output and "resume --run-id" in output
     assert "Run summary · Complete" not in output
     preserved = {
         path: path.read_bytes()
         for path in directory.rglob("*")
-        if path.is_file() and path.name not in {"run.json", "firecrawl-counts.json"}
+        if path.is_file()
+        and path.name
+        not in {
+            "run.json",
+            "firecrawl-counts.json",
+            "events.jsonl",
+            "context.json",
+            "profile.md",
+            "questions.json",
+            "source_index.json",
+        }
     }
     fresh_model, fresh_pages = WorkflowModel(), FakePages()
     monkeypatch.setattr(main, "OpenAIModel", lambda key, timeout: fresh_model)
@@ -226,7 +237,7 @@ def test_fresh_resume_across_automatic_handoff(
     assert main.main(["resume", "--run-id", directory.name]) == 0
     run = Run.model_validate(read_json(directory, "run.json"))
     assert run.stage == "research" and run.status == "complete"
-    assert run.model_calls == 6 and run.settings.max_model_calls == 34
+    assert run.model_calls == 7 and run.settings.max_model_calls == 35
     assert run.research_page_budget == 20 and run.research_page_attempts == 1
     assert not fresh_model.orientation.requests and not fresh_pages.mapped
     assert len(fresh_model.research.requests) == 2 and len(fresh_pages.scraped) == 1
@@ -265,7 +276,7 @@ def test_active_research_resume_does_not_reset_allowances(
         == 0
     )
     run = Run.model_validate(read_json(directory, "run.json"))
-    assert run.model_calls == 7 and run.settings.max_model_calls == 40
+    assert run.model_calls == 8 and run.settings.max_model_calls == 40
     assert run.research_page_budget == 3 and run.research_page_attempts == 2
     assert not fresh_model.orientation.requests and not fresh_pages.mapped
     assert len(fresh_model.research.requests) == 1 and len(fresh_pages.scraped) == 1

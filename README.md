@@ -1,14 +1,13 @@
 # Company research agent
 
-One local Python agent first reads your company and product overview pages, writes
-a provisional Markdown profile, and maps the company site. By default it then
-automatically continues into HTML research: the same agent searches
-the saved index, reads selected evidence, revises the profile, and finishes with a
-reason. Orientation and research are runtime-loaded skills of the same agent.
+One local agent reads the starting company/product pages, saves a provisional
+profile and a small question index, maps the site, then automatically continues
+into HTML research. Questions are dynamically prioritized; a source can inform
+any question, including inactive ones. All exchanges survive handoff and resume.
 
 ## Setup
 
-Requires Python 3.13 and uv. Run from this repository:
+Requires Python 3.13 and uv:
 
 ```bash
 uv sync --locked
@@ -16,179 +15,143 @@ uv sync --locked
 test -e .env || cp .env.example .env
 ```
 
-Edit `.env` to set `OPENAI_API_KEY`, `FIRECRAWL_API_KEY`, and `OPENAI_MODEL` to the
-exact OpenAI Responses API model you intend to use. The model must support strict
-function tools and `reasoning.encrypted_content`. No model is selected or silently
-substituted. Existing shell environment variables take precedence over `.env`.
-Existing `.env` and research data are never migrated or overwritten by setup.
-Old `AGENT_SYSTEM_*` settings are not used.
+Set `OPENAI_API_KEY`, `FIRECRAWL_API_KEY`, and `OPENAI_MODEL` in `.env`. The exact
+model must support Responses API strict tools and encrypted reasoning replay.
+There is no default model or fallback. Shell variables take precedence over `.env`.
+Set `RESEARCH_CONTEXT_TOKENS` to your model's supported context capacity; the
+128000 default is a configured ceiling, not model metadata.
+
+Token counting uses tiktoken 0.14.0. Known models use its registered encoding;
+unknown models fail explicitly. Set `RESEARCH_ENCODING` to a verified encoding
+name if needed (for example `o200k_base` for supported GPT-5 models). The first
+encoding load may download its public vocabulary; subsequent counting is local.
+See the [official model mapping](https://github.com/openai/tiktoken/blob/main/tiktoken/model.py).
 
 ## Start and resume
 
-These commands make paid provider calls when valid credentials are configured:
+These commands use paid APIs when valid credentials are configured:
 
 ```bash
 uv run python -m research_agent.main start \
-  --company "Example Company" \
-  --product "Example Product" \
-  --company-url "https://example.com/" \
-  --product-url "https://example.com/product" \
-  --instructions "Distinguish product claims from company-wide claims."
-
-# Replace with the run ID printed by start:
-uv run python -m research_agent.main resume --run-id orientation_YOUR_RUN_ID
-```
-
-`start` runs orientation → research in one invocation. Research defaults to 30
-additional model calls, 20 new page-fetch attempts, a 160000-byte conservative
-input allowance, and 20 index results per query. Override these on `start` with
-`--model-calls`, `--page-budget`, `--input-allowance`, and `--index-result-limit`.
-These flags apply only to research; orientation retains the environment settings.
-The model-call ceiling remains cumulative across both stages.
-
-To stop after orientation instead:
-
-```bash
-uv run python -m research_agent.main start --orientation-only \
   --company "Example Company" --product "Example Product" \
   --company-url "https://example.com/" \
   --product-url "https://example.com/product"
+
+uv run python -m research_agent.main resume --run-id orientation_YOUR_RUN_ID
 ```
 
-The workflow choice and research allowances are saved at creation. Resume finishes
-interrupted orientation and performs any pending automatic transition for full
-workflow runs. Orientation errors stop before research. Only research completion
-reports the full workflow complete; the terminal shows “Orientation complete —
-continuing to research” at the handoff. Active research resumes with its current
-budgets, and completed research makes no new provider calls.
-
-Identical starting URLs are read once. Orientation completes only after both starting
-pages have been read successfully, a nonempty profile with saved-source references
-exists, and mapping succeeds. Missing information can remain unknown in the profile.
-Failures exit with code 1 and preserve work. Resume opens the same SQLite thread and
-uses saved captures, model responses, and tool results. It does not support legacy
-`agent_system` jobs. Their data remains untouched.
-
-Limits are persisted at start. Resume keeps the original model and configuration,
-with explicit limit overrides for the current stage (a pending automatic handoff
-still uses the research allowances saved at creation):
-
-```bash
-uv run python -m research_agent.main resume --run-id orientation_YOUR_RUN_ID \
-  --max-model-calls 20 --input-allowance 160000
-```
-
-Increase the input allowance only if the configured model has enough context
-capacity, including output tokens. Full evidence is never silently truncated.
-
-## Continue into research
-
-For an older or `--orientation-only` run, use the same run ID after orientation
-completes. All three allowances are required;
-this command also makes paid provider calls:
+`start --orientation-only` stops after the initial profile, question index, and
+site map. Identical starting URLs are read once. To explicitly continue a completed
+version-2 orientation:
 
 ```bash
 uv run python -m research_agent.main research --run-id orientation_YOUR_RUN_ID \
-  --model-calls 30 --page-budget 20 --input-allowance 160000 \
-  --index-result-limit 20
+  --model-calls 30 --page-budget 20 --input-token-limit 96000
 ```
 
-`--model-calls` adds an allowance to the existing request count (the cumulative
-ceiling is 1000). `--page-budget` allows 1–10000 new research fetch attempts,
-including failed or blocked fetches. Cached reads are free; SDK retries are not
-separate logical attempts. `--input-allowance` is the full serialized-input guard,
-not a token count; choose it within your model's capacity. Research retains **all**
-research exchanges and stops incomplete when an allowance is exhausted. It never
-compacts or silently truncates them. The existing orientation compaction remains.
-
-Research tools are `query_site_index`, `read_page`, `update_profile`, and
-`finish_research`. Index queries match every case-insensitive substring term across
-URL/title/description; double quotes group phrases. An optional path substring
-filter and zero-based offset support paging. Results sort by URL, report total
-matches and whether evidence is saved, and never fetch pages. The default result
-limit is 20, configurable above; each call can request 1–50 results.
-
-Reads are restricted to indexed or linked company pages and exact external URLs
-linked from company evidence. Company scope is the supplied company hostname
-(with a leading `www.` removed) and its subdomains. External pages cannot authorize
-more external URLs. Redirect destinations must also satisfy the scope. Unsupported
-formats and access-blocked pages return recoverable results, not evidence. Provider
-outages and corrupted files pause the run. Only HTML is supported; no external
-search, PDF/media processing, or additional agents are used.
-
-`update_profile` replaces the full Markdown profile and validates local source
-citations. Earlier revisions remain in archived tool calls. Research completes
-only through `finish_research`; its reason is saved separately from the findings
-and unanswered interview questions in `profile.md`.
-
-Resume research with the usual command; optional overrides are **total ceilings**,
-not additional allowances:
+Those three flags are required for explicit research and have the shown defaults
+on `start`. They apply to research; orientation uses environment settings.
+`--index-result-limit` defaults to 20. Model-call allowances are additional at
+transition (maximum cumulative ceiling 1000); page budgets include failed fetches
+but exclude cached reuse and SDK retries. Resume overrides are total ceilings:
 
 ```bash
 uv run python -m research_agent.main resume --run-id orientation_YOUR_RUN_ID \
-  --max-model-calls 60 --page-budget 30 --input-allowance 200000
+  --max-model-calls 60 --page-budget 30 --input-token-limit 110000 \
+  --context-tokens 128000
 ```
 
-Runs created before automatic continuation have no saved workflow intent and keep
-their previous behavior: resume never opts them into research. The same applies
-to new `--orientation-only` runs. An interrupted research transition is completed
-on resume once its snapshot exists. Its initial profile and
-instructions are frozen before activation; later profile edits do not change that
-saved context. A completed research run resumes without new calls; starting a
-second research phase on that run is not supported.
+Input estimates include instructions, retained exchanges, tool schemas, and framing
+reserve. Output space is reserved inside context capacity. Encrypted reasoning is
+opaque: each payload reserves the configured output maximum rather than tokenizing
+ciphertext. These estimates are not provider usage. No compaction or silent
+truncation occurs. Budget/context exhaustion leaves work incomplete and never
+changes open questions to interview questions automatically.
+
+## Research behavior
+
+`update_questions` saves the full ordered question index and active open question.
+The active question guides source selection, not what may be learned. Record useful
+evidence for every affected question, including clearly labeled, cited inference.
+Question order expresses priority. Answers are documented, inferred, or mixed.
+
+Assess only relevant, successfully read sources. Three distinct consecutive pages
+without progress permit `needs_interview`; useful evidence resets that question's
+streak. Duplicate assessments and failed/blocked reads cannot inflate the count.
+Earlier deferral requires explaining exhausted plausible public leads. Use
+“unresolved through public research.” Later evidence can reopen or answer questions.
+Interview questions are a subset of this index, not a separate artifact.
+
+`query_site_index` matches any search term across URL/title/description, ranked by
+number of matched terms then URL. `required_phrase` requires an exact substring;
+`url_contains` filters the entire decoded URL. Empty search browses. Pagination
+reports counts and saved-source status; querying never scrapes pages.
+
+`read_page` returns complete cleaned HTML evidence and a stable run-local source ID
+such as `S1`. Repeated reads reuse it. Cite claims as `[S1]` in profiles and answers.
+Reads remain limited to indexed/linked company pages and resources directly linked
+from company evidence. No external search, additional agents, or PDF/media work.
+
+`finish_research` validates the supplied final profile, question index, and reason,
+saves both artifacts, and then records completion. No open questions are allowed.
+Reference checks establish source existence/integrity, not factual truth.
+
+## Local dashboard
+
+```bash
+uv run python -m research_agent.main dashboard
+# Optional: --run-id orientation_YOUR_RUN_ID --port 8765 --data-dir data
+```
+
+Open [localhost dashboard](http://127.0.0.1:8765). It is read-only and uses no API
+credentials. Start/resume remains in the CLI. The left pane follows activity only
+while you are at the bottom. The right pane shows saved metrics, per-call usage,
+questions in saved priority order, the profile, and full cleaned sources. Clicking
+`[S1]` opens that source. Both panes scroll independently; polling preserves tab,
+expansion, and scroll state. Unknown usage is shown as unavailable; cached input
+and reasoning output are subsets, never added twice. Profile rendering supports
+headings, paragraphs, and citations; arbitrary HTML is displayed as text.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | required | OpenAI credential; never stored in run metadata |
-| `FIRECRAWL_API_KEY` | required | Firecrawl credential; never stored in run metadata |
-| `OPENAI_MODEL` | required | Exact model name, persisted with the run |
-| `RESEARCH_DATA_DIR` | `data` | Data root, relative to current directory; `--data-dir` overrides it |
-| `RESEARCH_MAX_MODEL_CALLS` | `12` | Initial orientation ceiling for logical model requests |
-| `RESEARCH_INPUT_ALLOWANCE` | `96000` | Conservative serialized UTF-8 input bytes plus 2048 framing reserve |
-| `RESEARCH_OUTPUT_TOKENS` | `8000` | Maximum model output tokens |
-| `RESEARCH_TIMEOUT_SECONDS` | `120` | Timeout for each provider attempt; Firecrawl server timeout also set |
-| `RESEARCH_MAP_LIMIT` | `5000` | Maximum requested discovery entries |
+| `OPENAI_MODEL` | required | Exact provider model |
+| `OPENAI_API_KEY`, `FIRECRAWL_API_KEY` | required for research | Provider credentials |
+| `RESEARCH_DATA_DIR` | `data` | Data root; CLI `--data-dir` overrides |
+| `RESEARCH_MAX_MODEL_CALLS` | `12` | Orientation model-call ceiling |
+| `RESEARCH_INPUT_TOKEN_LIMIT` | `96000` | Estimated input-token ceiling |
+| `RESEARCH_CONTEXT_TOKENS` | `128000` | Configured context capacity, including output |
+| `RESEARCH_ENCODING` | model mapping | Explicit verified tiktoken encoding |
+| `RESEARCH_OUTPUT_TOKENS` | `8000` | Maximum output tokens |
+| `RESEARCH_TIMEOUT_SECONDS` | `120` | Provider attempt timeout |
+| `RESEARCH_MAP_LIMIT` | `5000` | Discovery entry limit |
 
-OpenAI retries temporary failures once through its SDK. Firecrawl 4.54.0's
-`max_retries=2` means two total attempts, retrying 502/transport errors. Other
-Firecrawl failures stop for explicit resume. SDK retries may repeat paid calls;
-the model-call limit counts logical requests, so at most two HTTP attempts per
-request are possible. There is no outer retry loop or custom accounting framework.
+Old byte allowance options/settings are not interpreted as token values. OpenAI
+retries once; Firecrawl permits two total attempts. No outer retry loop is added.
+Logical reservations count failures, while SDK retries may incur extra charges.
 
-## Outputs
+## Saved artifacts and compatibility
 
-Each run lives under `data/runs/<run_id>/`:
+Runs live in `data/runs/<run_id>/`:
 
-- `profile.md`: flexible, provisional company/product understanding and citations.
-- `site_index.json`: deduplicated URLs, available titles/descriptions, counts and
-  discovery limitations. Sitemap/subdomain mapping is broad, never exhaustive.
-- `sources/`: original capture JSON (HTML, raw HTML, Markdown), complete cleaned
-  Markdown, metadata, hashes, cleaning details, and retained failed captures.
-- `run.json`: inputs, configuration, stage/status, cumulative requests, research fetch budget/attempts, and creation-time workflow intent with research allowances.
-- `checkpoints.sqlite`: framework-managed execution state with file references.
-- `debug/`: model requests/responses, complete tool results and failure records.
-- `system.md`, `user.json`: original orientation prompt and skill snapshots.
-- `context/initial-profile.v1.json`: orientation compaction snapshot; original evidence and transcripts remain archived.
-- `research/start.json`: frozen research instructions, initial profile/source references, allowances and original orientation run metadata.
-- `research/checkpoints.sqlite`, `research/completion.json`: separate research checkpoints and explicit completion reason. Research transcript files use a `research-turn-` prefix; cumulative `call-` records cover both stages.
+- `run.json` (version 2), `profile.md`, `questions.json`, `source_index.json`, and
+  `site_index.json`: state, findings, priorities, source IDs, and discovery leads.
+- `sources/`: complete cleaned Markdown, captures, hashes, and failed captures.
+- `events.jsonl`: sanitized CLI events used for incremental dashboard polling.
+- `debug/`: requests, responses, full tool results, usage, context estimate, failures.
+- `checkpoints.sqlite`, `research/checkpoints.sqlite`: same run ID, transcript
+  references rather than large payloads. Research starts with orientation history.
+- `system.md`, `user.json`, `research/start.json`, `research/user.json`: frozen
+  instructions and durable handoff references. `research/completion.json` records
+  successful completion after final artifact writes.
 
-Run files contain research content and full debugging transcripts; keep them
-private. `.env`, `.venv`, and `data/` are ignored by Git. Terminal output is centralized in `cli.py`: it shows skill loading, model calls,
-tool parameters, compact results, and safe errors. HTTP request logs are suppressed.
-Each model response shows input/output tokens and cumulative reported usage,
-including saved responses on resume. A final run summary shows total reported
-tokens and model/Firecrawl request counts, including on failure. Counts include
-failed/reserved logical requests but exclude SDK retries and cached reuse. Older
-runs without Firecrawl counters are labeled as having incomplete call history.
-Cached input and reasoning tokens are subsets,
-not added again. Missing provider usage is marked unavailable; failed requests
-without usage cannot be included. Long profile parameters show a short preview;
-full content remains in the run files. Only one process
-may operate on a run at a time (local Unix file lock).
+Legacy runs remain untouched and viewable with unavailable fields labeled, but
+cannot resume under the new schemas or frozen prompts. Start a new run; there is
+no automatic migration. `.env`, `.venv`, and `data/` are ignored. Run artifacts
+contain private research/transcripts; only one writer may hold a run's local lock.
 
-## Offline verification
+## Verification
 
 ```bash
 uv run ruff check .
@@ -197,9 +160,5 @@ uv run mypy src/research_agent
 uv run pytest
 ```
 
-Tests use temporary directories, real SQLite checkpoints, fake model/page
-responses, and fake HTTP transports. They do not call paid APIs. Live provider
-availability and model permissions are not established by these tests.
-
-Read [docs/design.md](docs/design.md) for the small implementation map, recovery
-semantics, API references, and original commit provenance.
+Tests use fake providers and temporary files with real SQLite persistence. They
+make no paid calls. See [docs/design.md](docs/design.md) for recovery details.

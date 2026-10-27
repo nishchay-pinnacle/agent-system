@@ -3,7 +3,7 @@
 import json
 from importlib.resources import files
 from pathlib import Path
-from typing import NotRequired, Protocol, TypedDict
+from typing import Protocol, TypedDict
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -22,15 +22,14 @@ from research_agent.storage import (
     ResearchStart,
     Run,
     activate_research,
-    load_orientation_snapshot,
     load_research_start,
     local_path,
     read_json,
     save_json,
-    save_orientation_snapshot,
     save_run,
     write_text,
 )
+from research_agent.token_counting import estimate_input
 from research_agent.tools import OrientationTools, ToolInputError, tool_models
 
 CREATE_PARAMS = TypeAdapter(ResponseCreateParamsNonStreaming)
@@ -68,7 +67,6 @@ class OpenAIModel:
 class State(TypedDict):
     history: list[str]
     turn: int
-    baseline: NotRequired[str]
 
 
 def initialize_prompts(directory: Path, run: Run) -> None:
@@ -92,12 +90,20 @@ def initialize_prompts(directory: Path, run: Run) -> None:
 
 def tool_schema(model: type[BaseModel]) -> dict[str, JsonValue]:
     schema = JSON_OBJECT.validate_python(model.model_json_schema())
-    properties = schema.get("properties")
-    if isinstance(properties, dict):
-        schema["required"] = list(properties)
-        for value in properties.values():
-            if isinstance(value, dict):
-                value.pop("default", None)
+
+    def strict(value: JsonValue) -> None:
+        if isinstance(value, dict):
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                value["required"] = list(properties)
+            value.pop("default", None)
+            for child in value.values():
+                strict(child)
+        elif isinstance(value, list):
+            for child in value:
+                strict(child)
+
+    strict(schema)
     return schema
 
 
@@ -108,9 +114,11 @@ def begin_research(
     *,
     model_calls: int,
     page_budget: int,
-    input_allowance: int,
+    input_token_limit: int,
     index_result_limit: int = 20,
 ) -> None:
+    if run.version != 2:
+        raise ValueError("Legacy runs cannot resume under new schemas; start a new run")
     if run.stage != "orientation" or run.status != "complete":
         raise ValueError(
             "Research requires a completed orientation; use resume for an existing research stage"
@@ -121,20 +129,24 @@ def begin_research(
         )
     if not local_path(directory, RESEARCH_START).exists():
         package = files("research_agent")
+        with SqliteSaver.from_conn_string(
+            str(local_path(directory, "checkpoints.sqlite"))
+        ) as saver:
+            checkpoint = saver.get({"configurable": {"thread_id": run.run_id}})
+        if checkpoint is None:
+            raise ValueError("Orientation checkpoint missing; restore run files")
+        history = TypeAdapter(list[str]).validate_python(
+            checkpoint["channel_values"]["history"]
+        )
         start = ResearchStart(
             original_run=run.model_copy(deep=True),
             system=package.joinpath("prompts/system.md").read_text()
             + "\n\n"
             + package.joinpath("skills/research/SKILL.md").read_text(),
-            user=package.joinpath("prompts/user.md")
-            .read_text()
-            .format(**run.inputs.model_dump())
-            + "\nContinue this task into research now. Orientation is complete.",
-            profile=local_path(directory, "profile.md").read_bytes().decode("utf-8"),
-            sources=tools.saved_sources(),
+            history=history,
             model_calls=model_calls,
             page_budget=page_budget,
-            input_allowance=input_allowance,
+            input_token_limit=input_token_limit,
             index_result_limit=index_result_limit,
         )
         # Validate the cumulative limit before persisting the transition intent.
@@ -150,9 +162,9 @@ def begin_research(
         if (
             start.model_calls,
             start.page_budget,
-            start.input_allowance,
+            start.input_token_limit,
             start.index_result_limit,
-        ) != (model_calls, page_budget, input_allowance, index_result_limit):
+        ) != (model_calls, page_budget, input_token_limit, index_result_limit):
             raise ValueError(
                 "Research transition already prepared with different allowances; use resume"
             )
@@ -167,9 +179,10 @@ def definitions(stage: str = "orientation") -> list[dict[str, JsonValue]]:
             "description": {
                 "read_page": "Read a permitted HTML page; returns full cleaned evidence and its saved source reference.",
                 "update_profile": "Replace the full Markdown profile with saved-source citations and remaining uncertainties.",
+                "update_questions": "Save the full ordered question index and active question. Assess relevant successfully read sources for every affected question; useful evidence resets that question’s streak. Preserve prior assessments in order.",
                 "build_site_index": "Map the company root broadly after saving the profile; returns counts and limitations, then orientation stops.",
-                "query_site_index": "Search saved URLs, titles and descriptions case-insensitively. All whitespace-separated terms must occur; double quotes group an exact substring phrase. Empty query matches all. Optional path_filter is a case-insensitive substring of the decoded URL path. Results sort by URL. offset is zero-based; limit null uses the configured default, otherwise 1-50. Returns total/returned counts, next_offset and already_saved; never fetches pages.",
-                "finish_research": "Save a short completion reason and stop. Findings and unresolved interview questions must already be in profile.md.",
+                "query_site_index": "Search any query term across URL/title/description; rank by matched terms then URL. Optional required_phrase and url_contains constrain results. Empty query browses. Paginated discovery only.",
+                "finish_research": "Validate and save final profile, full question index and reason before completion. No open questions permitted.",
             }[name],
             "strict": True,
             "parameters": tool_schema(schema),
@@ -185,10 +198,17 @@ def run_agent(
     tools: OrientationTools,
     display: CLI | None = None,
 ) -> None:
+    if run.version != 2:
+        raise ValueError("Legacy runs cannot resume under new schemas; start a new run")
     display = display or CLI(directory)
     research = None
     if run.stage == "research" or local_path(directory, RESEARCH_START).exists():
         research = activate_research(directory, run)
+        save_json(
+            directory,
+            "research/user.json",
+            {"items": [{"role": "user", "content": research.receipt}]},
+        )
     tools.run, tools.settings = run, run.settings
     prefix = "research-" if run.stage == "research" else ""
 
@@ -198,42 +218,10 @@ def run_agent(
         request_name = f"debug/{prefix}turn-{turn:04d}.request.json"
         if not local_path(directory, response_name).exists():
             items: list[dict[str, JsonValue]] = []
-            if research is not None:
-                items = [
-                    {"role": "user", "content": research.user},
-                    {
-                        "role": "assistant",
-                        "content": research.receipt
-                        + "\n\nSaved sources:\n"
-                        + "\n".join(research.sources)
-                        + "\n\nCurrent profile at research start:\n"
-                        + research.profile,
-                    },
-                ]
-            if baseline := state.get("baseline"):
-                snapshot = load_orientation_snapshot(directory, baseline, run.inputs)
-                items.extend(
-                    JSON_ITEMS.validate_python(
-                        read_json(directory, "user.json")["items"]
-                    )
-                )
-                items.append(
-                    {
-                        "role": "assistant",
-                        "content": snapshot.receipt
-                        + "\n\nStarting sources:\n"
-                        + "\n".join(snapshot.sources)
-                        + "\n\nSaved initial profile:\n"
-                        + snapshot.profile,
-                    }
-                )
             for reference in state["history"]:
                 saved_items = JSON_ITEMS.validate_python(
                     read_json(directory, reference)["items"]
                 )
-                # SDK response objects serialize absent optional fields as null,
-                # while input TypedDicts require those fields to be omitted.
-                # Normalize replay only; retain the original response on disk.
                 items.extend(
                     {key: value for key, value in item.items() if value is not None}
                     for item in saved_items
@@ -252,14 +240,14 @@ def run_agent(
                 "max_output_tokens": run.settings.output_tokens,
                 "truncation": "disabled",
             }
-            # UTF-8 bytes plus framing reserve is deliberately conservative for text
-            # BPE inputs. This is an allowance guard, not provider token accounting.
-            allowance_used = (
-                len(json.dumps(request, ensure_ascii=False).encode()) + 2048
-            )
-            if allowance_used > run.settings.input_allowance:
+            estimate = estimate_input(request, run.settings)
+            save_json(directory, "debug/context.json", estimate)
+            if estimate["estimated_tokens"] > min(
+                run.settings.input_token_limit,
+                run.settings.context_tokens - run.settings.output_tokens,
+            ):
                 raise ValueError(
-                    f"Complete model input requires a conservative allowance of {allowance_used}; configured {run.settings.input_allowance}. Nothing truncated. Resume with --input-allowance only within the model's capacity."
+                    f"Complete model input estimated at {estimate['estimated_tokens']} tokens exceeds input/context limit. Nothing truncated. Resume with --input-token-limit and --context-tokens only within the model's capacity."
                 )
             if run.model_calls >= run.settings.max_model_calls:
                 raise ValueError(
@@ -334,18 +322,6 @@ def run_agent(
                 read_json(directory, result_name)["items"]
             )
             result = JSON_OBJECT.validate_json(str(saved_items[0]["output"]))
-        if (
-            run.stage == "orientation"
-            and name == "update_profile"
-            and result.get("saved") is True
-            and not state.get("baseline")
-        ):
-            if not tools.pages_read():
-                raise ValueError(
-                    "Cannot snapshot orientation without both starting sources"
-                )
-            baseline = save_orientation_snapshot(directory, run.inputs)
-            return {"history": [], "turn": state["turn"] + 1, "baseline": baseline}
         return {"history": state["history"] + [result_name], "turn": state["turn"] + 1}
 
     def route(state: State) -> str:
@@ -374,8 +350,6 @@ def run_agent(
         with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
             compiled = graph.compile(checkpointer=saver)
             snapshot = compiled.get_state(config)
-            if baseline := snapshot.values.get("baseline"):
-                load_orientation_snapshot(directory, baseline, run.inputs)
             if snapshot.values and not snapshot.next:
                 if not tools.complete():
                     raise ValueError(
@@ -386,7 +360,9 @@ def run_agent(
                     None
                     if snapshot.values
                     else {
-                        "history": [] if research is not None else ["user.json"],
+                        "history": research.history + ["research/user.json"]
+                        if research is not None
+                        else ["user.json"],
                         "turn": 0,
                     }
                 )

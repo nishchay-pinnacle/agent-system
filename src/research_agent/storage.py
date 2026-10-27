@@ -88,7 +88,9 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str = Field(min_length=1)
     max_model_calls: int = Field(default=12, ge=1, le=1000)
-    input_allowance: int = Field(default=96000, ge=1000)
+    input_token_limit: int = Field(default=96000, ge=1000)
+    context_tokens: int = Field(default=128000, ge=1000)
+    encoding: str | None = None
     output_tokens: int = Field(default=8000, ge=256)
     timeout_seconds: float = Field(default=120, gt=0, le=3600)
     map_limit: int = Field(default=5000, ge=1, le=100000)
@@ -102,12 +104,12 @@ class WorkflowIntent(BaseModel):
     full_workflow: bool
     model_calls: int = Field(ge=1, le=1000)
     page_budget: int = Field(ge=1, le=10000)
-    input_allowance: int = Field(ge=1000)
+    input_token_limit: int = Field(ge=1000)
     index_result_limit: int = Field(ge=1, le=50)
 
 
 class Run(BaseModel):
-    version: int = 1
+    version: int = 2
     run_id: str
     inputs: Inputs
     settings: Settings
@@ -211,55 +213,6 @@ def record_firecrawl_call(directory: Path, operation: Literal["scrape", "map"]) 
     save_json(directory, "debug/firecrawl-counts.json", counts.model_dump())
 
 
-ORIENTATION_SNAPSHOT = "context/initial-profile.v1.json"
-ORIENTATION_RECEIPT = (
-    "Both starting-page inputs have been processed and the initial profile saved. "
-    "Remaining orientation work: build the company site index, then stop."
-)
-
-
-class OrientationSnapshot(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    version: Literal[1] = 1
-    profile: str = Field(min_length=1)
-    sources: list[str] = Field(min_length=1)
-    receipt: str
-
-
-def load_orientation_snapshot(
-    directory: Path, reference: str, inputs: Inputs
-) -> OrientationSnapshot:
-    if reference != ORIENTATION_SNAPSHOT:
-        raise ValueError(
-            "Unsupported orientation snapshot reference; preserve run files"
-        )
-    saved = read_json(directory, reference)
-    if saved.get("version") != 1:
-        raise ValueError("Unsupported orientation snapshot version; preserve run files")
-    snapshot = OrientationSnapshot.model_validate(saved)
-    if (
-        snapshot.sources != [f"sources/{source_id(url)}.md" for url in inputs.urls]
-        or snapshot.receipt != ORIENTATION_RECEIPT
-    ):
-        raise ValueError(
-            "Invalid orientation snapshot sources or receipt; restore run files"
-        )
-    return snapshot
-
-
-def save_orientation_snapshot(directory: Path, inputs: Inputs) -> str:
-    # A replay selects the first durable snapshot, never the mutable profile again.
-    if not local_path(directory, ORIENTATION_SNAPSHOT).exists():
-        snapshot = OrientationSnapshot(
-            profile=local_path(directory, "profile.md").read_bytes().decode("utf-8"),
-            sources=[f"sources/{source_id(url)}.md" for url in inputs.urls],
-            receipt=ORIENTATION_RECEIPT,
-        )
-        save_json(directory, ORIENTATION_SNAPSHOT, snapshot.model_dump())
-    load_orientation_snapshot(directory, ORIENTATION_SNAPSHOT, inputs)
-    return ORIENTATION_SNAPSHOT
-
-
 RESEARCH_START = "research/start.json"
 RESEARCH_RECEIPT = (
     "Orientation is complete and research is now active. The starting pages, initial "
@@ -271,22 +224,20 @@ RESEARCH_RECEIPT = (
 
 class ResearchStart(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    version: Literal[1] = 1
+    version: Literal[2] = 2
     original_run: Run
     system: str = Field(min_length=1)
-    user: str = Field(min_length=1)
-    profile: str = Field(min_length=1)
-    sources: list[str]
+    history: list[str]
     receipt: str = RESEARCH_RECEIPT
     model_calls: int = Field(ge=1, le=1000)
     page_budget: int = Field(ge=1, le=10000)
-    input_allowance: int = Field(ge=1000)
+    input_token_limit: int = Field(ge=1000)
     index_result_limit: int = Field(default=20, ge=1, le=50)
 
 
 def load_research_start(directory: Path, run: Run) -> ResearchStart:
     saved = read_json(directory, RESEARCH_START)
-    if saved.get("version") != 1:
+    if saved.get("version") != 2:
         raise ValueError("Unsupported research context version; preserve run files")
     start = ResearchStart.model_validate(saved)
     if (
@@ -314,7 +265,7 @@ def activate_research(directory: Path, run: Run) -> ResearchStart:
             {
                 **start.original_run.settings.model_dump(),
                 "max_model_calls": start.original_run.model_calls + start.model_calls,
-                "input_allowance": start.input_allowance,
+                "input_token_limit": start.input_token_limit,
                 "index_result_limit": start.index_result_limit,
             }
         )
@@ -322,3 +273,34 @@ def activate_research(directory: Path, run: Run) -> ResearchStart:
         run.research_page_budget = start.page_budget
         save_run(directory, run)
     return start
+
+
+class SourceAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    source_id: str = Field(pattern=r"^S[1-9][0-9]*$")
+    useful: bool
+
+
+class Question(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    id: str = Field(min_length=1, max_length=80)
+    question: str = Field(min_length=1)
+    status: Literal["open", "answered", "needs_interview"]
+    priority_reason: str = Field(min_length=1)
+    answer: str | None
+    answer_basis: Literal["documented", "inferred", "mixed"] | None
+    source_assessments: list[SourceAssessment]
+    closure_reason: str | None
+
+    @property
+    def unproductive_pages(self) -> int:
+        streak = 0
+        for assessment in self.source_assessments:
+            streak = 0 if assessment.useful else streak + 1
+        return streak
+
+
+class QuestionIndex(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    active_question_id: str | None
+    questions: list[Question]

@@ -4,11 +4,12 @@ import argparse
 import json
 import logging
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import JsonValue
 
-from research_agent.storage import Run, firecrawl_counts, read_json
+from research_agent.storage import Run, firecrawl_counts, local_path, read_json
 
 
 def configure_logging() -> None:
@@ -30,6 +31,7 @@ def preview(value: object) -> str:
 
 class CLI:
     def __init__(self, directory: Path | None = None) -> None:
+        self.directory = directory
         self.input_tokens = 0
         self.output_tokens = 0
         self.unknown_calls = 0
@@ -41,14 +43,49 @@ class CLI:
     def event(
         self, kind: str, name: str, details: Mapping[str, object] | None = None
     ) -> None:
-        print(f"\n{kind} · {name}", flush=True)
-        for key, value in (details or {}).items():
+        def sanitize(value: object) -> object:
+            if isinstance(value, Mapping):
+                return {
+                    str(key): "[redacted]"
+                    if any(
+                        secret in str(key).lower()
+                        for secret in ("api_key", "authorization", "password", "secret")
+                    )
+                    else sanitize(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, (list, tuple)):
+                return [sanitize(item) for item in value]
+            return value
+
+        safe = {
+            key: "[redacted]"
             if any(
                 secret in key.lower()
                 for secret in ("api_key", "authorization", "password", "secret")
-            ):
-                value = "[redacted]"
+            )
+            else sanitize(value)
+            for key, value in (details or {}).items()
+        }
+        print(f"\n{kind} · {name}", flush=True)
+        for key, value in safe.items():
             print(f"  {key}: {preview(value)}", flush=True)
+        if self.directory is not None:
+            with local_path(self.directory, "events.jsonl").open(
+                "a", encoding="utf-8"
+            ) as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "time": datetime.now(UTC).isoformat(),
+                            "kind": kind,
+                            "name": name,
+                            "details": safe,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
 
     def skill(self, name: str, status: str) -> None:
         self.event("Skill", name, {"Status": status})
@@ -163,13 +200,18 @@ def parser() -> argparse.ArgumentParser:
         "--max-model-calls", type=int, help="Explicit new total model-call allowance"
     )
     resume.add_argument(
-        "--input-allowance", type=int, help="Explicit new conservative input allowance"
+        "--input-token-limit", type=int, help="Explicit new input-token limit"
     )
     resume.add_argument(
         "--page-budget",
         type=int,
         help="Explicit new total research page-fetch allowance",
     )
+    resume.add_argument("--context-tokens", type=int)
+    resume.add_argument("--encoding")
+    dashboard = actions.add_parser("dashboard", help="Read-only localhost dashboard")
+    dashboard.add_argument("--run-id")
+    dashboard.add_argument("--port", type=int, default=8765)
     research = actions.add_parser(
         "research", help="Explicitly continue a completed orientation into research"
     )
@@ -186,7 +228,11 @@ def parser() -> argparse.ArgumentParser:
                 20,
                 "Research page-fetch attempts, including failures (1-10000)",
             ),
-            ("input-allowance", 160000, "Full research input allowance; no compaction"),
+            (
+                "input-token-limit",
+                96000,
+                "Full research input-token limit; no compaction",
+            ),
             ("index-result-limit", 20, "Default research index query page size (1-50)"),
         ):
             command.add_argument(
@@ -198,7 +244,7 @@ def parser() -> argparse.ArgumentParser:
                 required=command is research and flag != "index-result-limit",
                 help=help_text + (f"; default {default}" if command is start else ""),
             )
-    for command in (start, resume, research):
+    for command in (start, resume, research, dashboard):
         command.add_argument(
             "--data-dir",
             type=Path,

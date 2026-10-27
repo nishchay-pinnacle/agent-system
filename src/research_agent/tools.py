@@ -20,6 +20,7 @@ from research_agent.cleaning import clean_markdown, normalize_input, usable
 from research_agent.html_cleaning import ConversionError, clean_html
 from research_agent.storage import (
     Inputs,
+    QuestionIndex,
     Run,
     Settings,
     local_path,
@@ -138,7 +139,8 @@ class IndexArgs(BaseModel):
 class QueryArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     query: str
-    path_filter: str = ""
+    url_contains: str = ""
+    required_phrase: str = ""
     offset: int = Field(default=0, ge=0)
     limit: int | None = Field(default=None, ge=1, le=50)
 
@@ -146,12 +148,15 @@ class QueryArgs(BaseModel):
 class FinishArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     reason: str = Field(min_length=1, max_length=2000)
+    profile: str = Field(min_length=1)
+    question_index: QuestionIndex
 
 
 def tool_models(stage: str) -> dict[str, type[BaseModel]]:
     common: dict[str, type[BaseModel]] = {
         "read_page": ReadArgs,
         "update_profile": ProfileArgs,
+        "update_questions": QuestionIndex,
     }
     if stage == "orientation":
         return {**common, "build_site_index": IndexArgs}
@@ -227,6 +232,10 @@ def evidence_problem(capture: Capture) -> str | None:
         soup = BeautifulSoup(raw, "html.parser")
         main = soup.find("main") or soup.find(True, attrs={"role": "main"}) or soup
         heading, title = main.find("h1"), soup.find("title")
+        if title and re.fullmatch(pattern, title.get_text(" ", strip=True), re.I):
+            text = main.get_text(" ", strip=True)
+            if len(text) < 2000 and re.search(pattern, text, re.I):
+                return "Structural error/access-blocked capture"
         if heading and re.fullmatch(pattern, heading.get_text(" ", strip=True), re.I):
             if not main.find("article") or (
                 title and re.fullmatch(pattern, title.get_text(" ", strip=True), re.I)
@@ -391,13 +400,22 @@ class OrientationTools:
             completion = local_path(self.directory, "research/completion.json")
             if not completion.exists():
                 return False
-            reason = FinishArgs.model_validate(
-                read_json(self.directory, "research/completion.json")
-            )
-            if not reason.reason.strip():
+            reason = read_json(self.directory, "research/completion.json").get("reason")
+            if not isinstance(reason, str) or not reason.strip():
                 raise ValueError("Invalid saved research completion reason")
+        if profile.exists():
+            self.validate_profile(profile.read_text())
+        questions = local_path(self.directory, "questions.json")
+        if questions.exists():
+            self.validate_questions(
+                QuestionIndex.model_validate(
+                    read_json(self.directory, "questions.json")
+                ),
+                finishing=self.stage == "research",
+            )
         return (
-            ready
+            questions.exists()
+            and ready
             and profile.exists()
             and bool(profile.read_text().strip())
             and index.exists()
@@ -519,13 +537,110 @@ class OrientationTools:
             )
         self.validate_source(url)
         content = local_path(self.directory, reference).read_text(encoding="utf-8")
-        if len(content.encode()) + 2048 > self.settings.input_allowance:
-            raise ValueError(
-                "Complete page exceeds configured input allowance; saved without truncation. Increase --input-allowance on resume only if the configured model supports it."
+        sources = self.source_index()
+        short = next((key for key, value in sources.items() if value == url), None)
+        if short is None:
+            short = f"S{len(sources) + 1}"
+            sources[short] = url
+            save_json(self.directory, "source_index.json", sources)
+        return {"source_id": short, "source": reference, "url": url, "content": content}
+
+    def source_index(self) -> dict[str, str]:
+        path = local_path(self.directory, "source_index.json")
+        if not path.exists():
+            return {}
+        saved = read_json(self.directory, "source_index.json")
+        sources: dict[str, str] = {}
+        for key, value in saved.items():
+            if (
+                not re.fullmatch(r"S[1-9][0-9]*", key)
+                or not isinstance(value, str)
+                or not self.validate_source(value)
+            ):
+                raise ValueError("Invalid source index; restore run files")
+            sources[key] = value
+        if set(sources) != {f"S{i + 1}" for i in range(len(sources))} or len(
+            set(sources.values())
+        ) != len(sources):
+            raise ValueError("Invalid source index IDs; restore run files")
+        return sources
+
+    def validate_questions(
+        self, index: QuestionIndex, *, finishing: bool = False
+    ) -> QuestionIndex:
+        index = index.model_copy(deep=True)
+        ids = [q.id for q in index.questions]
+        if len(ids) != len(set(ids)):
+            raise ToolInputError("Question IDs must be unique")
+        if index.active_question_id is not None and not any(
+            q.id == index.active_question_id and q.status == "open"
+            for q in index.questions
+        ):
+            raise ToolInputError("Active question must exist and be open")
+        sources = self.source_index()
+        previous = {}
+        if local_path(self.directory, "questions.json").exists():
+            previous = {
+                q.id: q
+                for q in QuestionIndex.model_validate(
+                    read_json(self.directory, "questions.json")
+                ).questions
+            }
+        for question in index.questions:
+            assessments = (
+                {a.source_id: a for a in previous[question.id].source_assessments}
+                if question.id in previous
+                else {}
             )
-        return {"source": reference, "url": url, "content": content}
+            submitted: dict[str, bool] = {}
+            for assessment in question.source_assessments:
+                if assessment.source_id not in sources:
+                    raise ToolInputError(
+                        f"Source {assessment.source_id} is not saved evidence"
+                    )
+                if (
+                    assessment.source_id in submitted
+                    and submitted[assessment.source_id] != assessment.useful
+                ):
+                    raise ToolInputError("Conflicting duplicate source assessments")
+                submitted[assessment.source_id] = assessment.useful
+                old = assessments.get(assessment.source_id)
+                if old and old.useful and not assessment.useful:
+                    raise ToolInputError(
+                        "Useful evidence cannot be changed into an unproductive reread"
+                    )
+                if old and not old.useful and assessment.useful:
+                    del assessments[assessment.source_id]
+                assessments[assessment.source_id] = assessment
+            question.source_assessments = list(assessments.values())
+            self.validate_citations(question.answer or "")
+            if question.status == "answered" and (
+                not question.answer or not question.answer_basis
+            ):
+                raise ToolInputError(
+                    "Answered questions require an answer and answer_basis"
+                )
+            if question.status == "needs_interview" and not question.closure_reason:
+                raise ToolInputError(
+                    "Deferred questions require a closure reason, including exhausted public leads when fewer than three unproductive pages"
+                )
+            if finishing and question.status == "open":
+                raise ToolInputError("Cannot finish with open questions")
+        return index
+
+    def update_questions(self, index: QuestionIndex) -> dict[str, JsonValue]:
+        saved = self.validate_questions(index)
+        save_json(self.directory, "questions.json", saved.model_dump(mode="json"))
+        return {
+            "index": saved.model_dump(mode="json"),
+            "progress": {q.id: q.unproductive_pages for q in saved.questions},
+        }
 
     def validate_citations(self, content: str) -> None:
+        sources = self.source_index()
+        for sid in re.findall(r"\[(S[0-9]+)\]", content):
+            if sid not in sources:
+                raise ToolInputError(f"Citation {sid} is not saved evidence")
         for link in markdown_links(content):
             parts = urlsplit(link)
             if parts.scheme or parts.netloc:
@@ -549,7 +664,7 @@ class OrientationTools:
             ):
                 raise ValueError("Invalid citation source metadata; restore run files")
 
-    def update_profile(self, content: str) -> dict[str, JsonValue]:
+    def validate_profile(self, content: str) -> None:
         if not content.strip():
             raise ToolInputError("Profile must contain nonempty Markdown")
         if self.stage == "orientation":
@@ -558,23 +673,34 @@ class OrientationTools:
                     "Read both starting pages before writing the profile"
                 )
             for url in self.inputs.urls:
-                if f"sources/{source_id(url)}.md" not in content:
+                if not any(
+                    value == url and f"[{key}]" in content
+                    for key, value in self.source_index().items()
+                ):
                     raise ToolInputError(
-                        "Profile must reference every starting source using its saved path"
+                        "Profile must reference every starting source using its short source ID"
                     )
         self.validate_citations(content)
+
+    def update_profile(self, content: str) -> dict[str, JsonValue]:
+        self.validate_profile(content)
         write_text(self.directory, "profile.md", content)
         return {"artifact": "profile.md", "saved": True}
 
     def query_site_index(
         self,
         query: str,
-        path_filter: str = "",
+        url_contains: str = "",
         offset: int = 0,
         limit: int | None = None,
+        required_phrase: str = "",
     ) -> dict[str, JsonValue]:
         args = QueryArgs(
-            query=query, path_filter=path_filter, offset=offset, limit=limit
+            query=query,
+            url_contains=url_contains,
+            required_phrase=required_phrase,
+            offset=offset,
+            limit=limit,
         )
         limit = args.limit or self.settings.index_result_limit
         try:
@@ -591,12 +717,22 @@ class OrientationTools:
             entry.url = public_url(entry.url)
             haystack = f"{entry.url} {entry.title} {entry.description}".casefold()
             if (
-                all(term in haystack for term in terms)
-                and path_filter.casefold()
-                in unquote(urlsplit(entry.url).path).casefold()
+                (not terms or any(term in haystack for term in terms))
+                and url_contains.casefold() in unquote(entry.url).casefold()
+                and required_phrase.casefold() in haystack
             ):
                 matches[entry.url] = entry
-        urls = sorted(matches)
+        urls = sorted(
+            matches,
+            key=lambda url: (
+                -sum(
+                    term
+                    in f"{url} {matches[url].title} {matches[url].description}".casefold()
+                    for term in set(terms)
+                ),
+                url,
+            ),
+        )
         results: list[JsonValue] = []
         for url in urls[offset : offset + limit]:
             entry = matches[url]
@@ -620,23 +756,19 @@ class OrientationTools:
             "evidence": "Discovery leads only; read selected HTML pages before citing",
         }
 
-    def finish_research(self, reason: str) -> dict[str, JsonValue]:
+    def finish_research(
+        self, reason: str, profile: str, question_index: QuestionIndex
+    ) -> dict[str, JsonValue]:
         if self.stage != "research":
             raise ToolInputError("Research is not active")
-        if not reason.strip():
-            raise ToolInputError("Provide a short reason for finishing research")
+        if not reason.strip() or not profile.strip():
+            raise ToolInputError("Provide a nonempty profile and completion reason")
         self.validate_artifacts()
-        profile = local_path(self.directory, "profile.md").read_text()
-        if not profile.strip():
-            raise ToolInputError("Save a nonempty profile before finishing")
         self.validate_citations(profile)
-        completion = local_path(self.directory, "research/completion.json")
-        if not completion.exists():
-            save_json(
-                self.directory,
-                "research/completion.json",
-                FinishArgs(reason=reason).model_dump(),
-            )
+        index = self.validate_questions(question_index, finishing=True)
+        write_text(self.directory, "profile.md", profile)
+        save_json(self.directory, "questions.json", index.model_dump(mode="json"))
+        save_json(self.directory, "research/completion.json", {"reason": reason})
         return {"artifact": "research/completion.json", "finished": True}
 
     def build_site_index(self, site_url: str) -> dict[str, JsonValue]:
@@ -645,9 +777,10 @@ class OrientationTools:
         if (
             not self.pages_read()
             or not local_path(self.directory, "profile.md").exists()
+            or not local_path(self.directory, "questions.json").exists()
         ):
             raise ToolInputError(
-                "Read starting pages and save the profile before mapping"
+                "Read starting pages and save the profile and questions before mapping"
             )
         if local_path(self.directory, "site_index.json").exists():
             return self.saved_index()
@@ -703,6 +836,8 @@ class OrientationTools:
             raise ToolInputError(f"Invalid {name} arguments: {errors}") from exc
         except ValueError as exc:
             raise ToolInputError(str(exc)) from exc
+        if isinstance(args, QuestionIndex):
+            return self.update_questions(args)
         if isinstance(args, ReadArgs):
             return self.read_page(args.url)
         if isinstance(args, ProfileArgs):
@@ -711,8 +846,12 @@ class OrientationTools:
             return self.build_site_index(args.site_url)
         if isinstance(args, QueryArgs):
             return self.query_site_index(
-                args.query, args.path_filter, args.offset, args.limit
+                args.query,
+                args.url_contains,
+                args.offset,
+                args.limit,
+                args.required_phrase,
             )
         if isinstance(args, FinishArgs):
-            return self.finish_research(args.reason)
+            return self.finish_research(args.reason, args.profile, args.question_index)
         raise ToolInputError("Unsupported tool arguments")

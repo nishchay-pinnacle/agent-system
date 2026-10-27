@@ -8,7 +8,6 @@ from pydantic import JsonValue
 
 from research_agent.agent import initialize_prompts, run_agent
 from research_agent.storage import (
-    ORIENTATION_SNAPSHOT,
     Inputs,
     Run,
     Settings,
@@ -64,27 +63,34 @@ class FakeModel:
             isinstance(item, dict) and item.get("type") == "function_call_output"
             for item in items
         )
-        compacted = any(
-            isinstance(item, dict)
-            and item.get("role") == "assistant"
-            and str(item.get("content", "")).startswith(
-                "Both starting-page inputs have been processed and the initial profile saved."
-            )
-            for item in items
-        )
-        if compacted:
-            name, arguments = "build_site_index", {"site_url": self.inputs.site_url}
-        elif completed < len(self.inputs.urls):
+        if completed < len(self.inputs.urls):
             name, arguments = "read_page", {"url": self.inputs.urls[completed]}
         elif completed == len(self.inputs.urls):
             name = "update_profile"
             arguments = {
                 "content": "# Provisional product profile\nCompany claims exports require Pro. Pricing unknown.\n"
-                + "\n".join(
-                    f"[Source](sources/{source_id(url)}.md)" for url in self.inputs.urls
-                )
+                + "\n".join(f"[S{i + 1}]" for i, url in enumerate(self.inputs.urls))
             }
         elif completed == len(self.inputs.urls) + 1:
+            name, arguments = (
+                "update_questions",
+                {
+                    "active_question_id": None,
+                    "questions": [
+                        {
+                            "id": "Q1",
+                            "question": "Where is the product available?",
+                            "status": "open",
+                            "priority_reason": "Adoption feasibility",
+                            "answer": None,
+                            "answer_basis": None,
+                            "source_assessments": [],
+                            "closure_reason": None,
+                        }
+                    ],
+                },
+            )
+        elif completed == len(self.inputs.urls) + 2:
             name, arguments = "build_site_index", {"site_url": self.inputs.site_url}
         else:
             pytest.fail("Agent continued beyond orientation")
@@ -115,7 +121,9 @@ def setup_run(
     run = Run(
         run_id="orientation_test",
         inputs=inputs,
-        settings=Settings(model="explicit-test-model", **settings),
+        settings=Settings(
+            model="explicit-test-model", encoding="o200k_base", **settings
+        ),
     )
     directory = run_directory(tmp_path, run.run_id)
     directory.mkdir()
@@ -138,7 +146,7 @@ def test_orientation_saves_artifacts_and_stops(tmp_path: Path, identical: bool) 
     execute(directory, run, model, pages)
     assert run.status == "complete"
     assert pages.scraped == run.inputs.urls
-    assert len(model.requests) == len(run.inputs.urls) + 2
+    assert len(model.requests) == len(run.inputs.urls) + 3
     assert pages.mapped == [run.inputs.site_url]
     assert (directory / "profile.md").read_text().startswith("# Provisional")
     index = read_json(directory, "site_index.json")
@@ -147,7 +155,7 @@ def test_orientation_saves_artifacts_and_stops(tmp_path: Path, identical: bool) 
     assert (
         "entries"
         not in read_json(
-            directory, f"debug/turn-{len(run.inputs.urls) + 1:04d}.tool.json"
+            directory, f"debug/turn-{len(run.inputs.urls) + 2:04d}.tool.json"
         )["items"][0]["output"]
     )
     for url in run.inputs.urls:
@@ -181,7 +189,7 @@ def test_failed_page_is_incomplete_then_resume_reuses_first_page(
     execute(directory, reopened, fresh_model, fresh_pages)
     assert fresh_pages.scraped == [run.inputs.product_url]
     assert (
-        len(fresh_model.requests) == 2
+        len(fresh_model.requests) == 3
     )  # cached failed tool request is not regenerated
     assert reopened.status == "complete"
 
@@ -207,31 +215,31 @@ def test_model_limit_persists_and_can_be_explicitly_increased(tmp_path: Path) ->
     reopened = Run.model_validate(read_json(directory, "run.json"))
     with pytest.raises(ValueError, match="limit exhausted"):
         execute(directory, reopened, FakeModel(run.inputs), FakePages())
-    reopened.settings.max_model_calls = 5
+    reopened.settings.max_model_calls = 6
     fresh_pages = FakePages()
     execute(directory, reopened, FakeModel(run.inputs), fresh_pages)
     assert fresh_pages.scraped == [run.inputs.product_url]
-    assert reopened.model_calls == 4
+    assert reopened.model_calls == 5
 
 
 def test_oversized_page_preserved_whole_then_resume_without_refetch(
     tmp_path: Path,
 ) -> None:
-    directory, run, model, pages = setup_run(tmp_path)
+    directory, run, model, pages = setup_run(tmp_path, input_token_limit=10000)
     pages.large = True
-    with pytest.raises(ValueError, match="without truncation"):
+    with pytest.raises(ValueError, match="Nothing truncated"):
         execute(directory, run, model, pages)
     path = directory / f"sources/{source_id(run.inputs.company_url)}.md"
     assert path.read_text().count("long evidence") == 10000
     reopened = Run.model_validate(read_json(directory, "run.json"))
-    reopened.settings.input_allowance = 1000000
+    reopened.settings.input_token_limit = 1000000
     fresh_pages = FakePages()
     execute(directory, reopened, FakeModel(run.inputs), fresh_pages)
     assert fresh_pages.scraped == [run.inputs.product_url]
 
 
 def test_total_context_allowance_stops_before_model(tmp_path: Path) -> None:
-    directory, run, model, pages = setup_run(tmp_path, input_allowance=1000)
+    directory, run, model, pages = setup_run(tmp_path, input_token_limit=1000)
     with pytest.raises(ValueError, match="Complete model input"):
         execute(directory, run, model, pages)
     assert not model.requests and run.model_calls == 0
@@ -246,7 +254,7 @@ def test_incomplete_model_response_is_retained_and_retried(tmp_path: Path) -> No
     assert not pages.scraped
     reopened = Run.model_validate(read_json(directory, "run.json"))
     execute(directory, reopened, FakeModel(run.inputs), FakePages())
-    assert reopened.model_calls == 5
+    assert reopened.model_calls == 6
 
 
 def test_saved_capture_reused_after_cleaning_interruption(tmp_path: Path) -> None:
@@ -319,7 +327,7 @@ def test_index_saved_before_checkpoint_is_not_remapped(
     original_save = agent.save_json
 
     def interrupted_save(directory: Path, name: str, value: object) -> None:
-        if name == "debug/turn-0003.tool.json":
+        if name == "debug/turn-0004.tool.json":
             raise OSError("Simulated interruption after successful map")
         original_save(directory, name, value)
 
@@ -397,7 +405,7 @@ def test_sdk_output_with_null_optionals_replays_after_resume(tmp_path: Path) -> 
     assert read_json(directory, "debug/turn-0000.response.json") == saved
 
 
-@pytest.mark.parametrize("budget", [3, 5, 6])
+@pytest.mark.parametrize("budget", [3, 6, 7])
 def test_rejected_profile_can_be_corrected_after_resume(
     tmp_path: Path, budget: int
 ) -> None:
@@ -427,7 +435,7 @@ def test_rejected_profile_can_be_corrected_after_resume(
             return response
 
     model = CorrectingModel(run.inputs)
-    if budget == 6:
+    if budget == 7:
 
         class LegacyTools(OrientationTools):
             def update_profile(self, content: str) -> dict[str, JsonValue]:
@@ -446,16 +454,16 @@ def test_rejected_profile_can_be_corrected_after_resume(
     if budget == 3:
         with pytest.raises(ValueError, match="limit exhausted"):
             execute(directory, run, model, pages)
-        assert not (directory / ORIENTATION_SNAPSHOT).exists()
+        assert not (directory / "context").exists()
         assert not (directory / "profile.md").exists()
         run = Run.model_validate(read_json(directory, "run.json"))
-        run.settings.max_model_calls = 5
+        run.settings.max_model_calls = 6
         model, pages = CorrectingModel(run.inputs), FakePages()
     execute(directory, run, model, pages)
-    assert run.status == "complete" and run.model_calls == 5
-    assert (directory / "profile.md").read_text().count("[Source]") == 2
-    if budget in {3, 6}:
-        assert len(model.requests) == 2 and not pages.scraped
+    assert run.status == "complete" and run.model_calls == 6
+    assert (directory / "profile.md").read_text().count("[S") == 2
+    if budget in {3, 7}:
+        assert len(model.requests) == 3 and not pages.scraped
 
 
 @pytest.mark.parametrize(
