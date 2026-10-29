@@ -118,3 +118,62 @@ def test_markdown_profile_renders_structure_without_executable_html(
     save_json(directory, "run.json", {"version": 2})
     (directory / "profile.md").write_text(content)
     assert state(directory)["profile_html"] == rendered
+
+
+def test_continuation_endpoint_checks_origin_request_and_allowances(
+    tmp_path: Path,
+) -> None:
+    from research_agent.storage import ContinuationRequest, read_json, save_run
+
+    directory, run, _, _ = setup_run(tmp_path)
+    run.continuation = ContinuationRequest(
+        request_id="request-1",
+        reason="Need evidence",
+        unresolved_questions=["Q1"],
+        next_steps="Read saved sources",
+        additional_calls=2,
+        additional_pages=0,
+    )
+    save_run(directory, run)
+    with ThreadingHTTPServer(
+        ("127.0.0.1", 0), handler(tmp_path, directory.name)
+    ) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = HTTPConnection("127.0.0.1", server.server_port)
+            origin = f"http://127.0.0.1:{server.server_port}"
+            decision = {
+                "request_id": "request-1",
+                "approve": True,
+                "additional_calls": 2,
+                "additional_pages": 0,
+            }
+            for change, request_origin, expected in [
+                ({}, "http://attacker.test", 403),
+                ({"request_id": "stale"}, origin, 400),
+                ({"additional_calls": -1}, origin, 400),
+                ({"additional_calls": 1000}, origin, 400),
+                ({"additional_pages": 1}, origin, 400),
+                ({}, origin, 204),
+                ({}, origin, 204),
+            ]:
+                conn.request(
+                    "POST",
+                    "/api/continuation",
+                    json.dumps({**decision, **change}),
+                    {"Content-Type": "application/json", "Origin": request_origin},
+                )
+                response = conn.getresponse()
+                assert response.status == expected
+                response.read()
+            assert read_json(directory, "continuation-decision.json") == decision
+            # Dashboard only records the decision; the runner owns allowances.
+            assert (
+                read_json(directory, "run.json")["settings"]["max_model_calls"]
+                == run.settings.max_model_calls
+            )
+            conn.close()
+        finally:
+            server.shutdown()
+            thread.join()

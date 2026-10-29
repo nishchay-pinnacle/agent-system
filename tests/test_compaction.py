@@ -20,7 +20,7 @@ def test_orientation_retains_source_profile_and_question_exchanges_on_resume(
     fresh_model, fresh_pages = FakeModel(run.inputs), FakePages()
     execute(directory, reopened, fresh_model, fresh_pages)
     items = fresh_model.requests[0]["input"]
-    assert len(items) == 9
+    assert len(items) == 14  # Nine original items plus five retained budget messages.
     assert "# Example" in str(items)
     assert "Provisional product profile" in str(items)
     assert "Where is the product available?" in str(items)
@@ -71,10 +71,13 @@ def test_full_utf8_request_bytes_include_reasoning_without_token_reserve(
     size = context["request_bytes"]
     reopened = Run.model_validate(read_json(directory, "run.json"))
     reopened.settings.max_model_calls = 5
-    reopened.settings.max_input_bytes = size - 1
+    reopened.settings.max_input_bytes = (
+        10000  # Budget messages also reflect the new ceiling.
+    )
     blocked = ReasoningModel(run.inputs)
     with pytest.raises(ValueError, match="Nothing truncated"):
         execute(directory, reopened, blocked, FakePages())
+    size = read_json(directory, "debug/context.json")["request_bytes"]
     assert not blocked.requests and reopened.model_calls == 4
     assert reopened.status == "incomplete"
     reopened = Run.model_validate(read_json(directory, "run.json"))

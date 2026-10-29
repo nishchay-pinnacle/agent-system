@@ -89,7 +89,7 @@ class Settings(BaseModel):
     model: str = Field(min_length=1)
     max_model_calls: int = Field(default=12, ge=1, le=1000)
     max_input_bytes: int = Field(default=1_000_000, ge=1)
-    output_tokens: int = Field(default=8000, ge=256)
+    output_tokens: int = Field(default=16000, ge=256)
     timeout_seconds: float = Field(default=120, gt=0, le=3600)
     map_limit: int = Field(default=5000, ge=1, le=100000)
     index_result_limit: int = Field(default=20, ge=1, le=50)
@@ -106,6 +106,29 @@ class WorkflowIntent(BaseModel):
     index_result_limit: int = Field(ge=1, le=50)
 
 
+class ContinuationArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    reason: str = Field(min_length=1, max_length=2000)
+    unresolved_questions: list[str]
+    next_steps: str = Field(min_length=1, max_length=2000)
+    additional_calls: int = Field(ge=1, le=1000)
+    additional_pages: int = Field(ge=0, le=10000)
+
+
+class ContinuationRequest(ContinuationArgs):
+    request_id: str
+    origin: Literal["model", "runtime"] = "model"
+    status: Literal["pending", "applied"] = "pending"
+
+
+class ContinuationDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    request_id: str
+    approve: bool
+    additional_calls: int = Field(ge=1, le=1000)
+    additional_pages: int = Field(ge=0, le=10000)
+
+
 class Run(BaseModel):
     version: int = 3
     run_id: str
@@ -115,6 +138,7 @@ class Run(BaseModel):
     model_calls: int = 0
     error: str | None = None
     stage: Literal["orientation", "research"] = "orientation"
+    continuation: ContinuationRequest | None = None
     workflow_intent: WorkflowIntent | None = None
     research_page_budget: int = Field(default=0, ge=0, le=10000)
     research_page_attempts: int = Field(default=0, ge=0)

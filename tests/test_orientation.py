@@ -223,7 +223,7 @@ def test_model_limit_persists_and_can_be_explicitly_increased(tmp_path: Path) ->
 def test_oversized_page_preserved_whole_then_resume_without_refetch(
     tmp_path: Path,
 ) -> None:
-    directory, run, model, pages = setup_run(tmp_path, max_input_bytes=10000)
+    directory, run, model, pages = setup_run(tmp_path, max_input_bytes=20000)
     pages.large = True
     with pytest.raises(ValueError, match="Nothing truncated"):
         execute(directory, run, model, pages)
@@ -397,7 +397,11 @@ def test_sdk_output_with_null_optionals_replays_after_resume(tmp_path: Path) -> 
     fresh_model = SDKModel(run.inputs)
     execute(directory, reopened, fresh_model, FakePages())
     assert reopened.status == "complete"
-    replay = fresh_model.requests[0]["input"][1]
+    replay = next(
+        item
+        for item in fresh_model.requests[0]["input"]
+        if item.get("type") == "function_call"
+    )
     assert "namespace" not in replay
     assert replay["call_id"] == "call-0"
     assert read_json(directory, "debug/turn-0000.response.json") == saved
@@ -503,3 +507,40 @@ def test_resume_rejects_damaged_artifacts_without_provider_calls(
     assert (
         not fresh_model.requests and not fresh_pages.scraped and not fresh_pages.mapped
     )
+
+
+def test_output_limit_error_and_saved_allowance_on_resume(tmp_path: Path) -> None:
+    class OutputLimitedModel(FakeModel):
+        def generate(self, request: dict[str, JsonValue]) -> dict[str, JsonValue]:
+            response = super().generate(request)
+            response["status"] = "incomplete"
+            response["incomplete_details"] = {"reason": "max_output_tokens"}
+            return response
+
+    directory, run, _, pages = setup_run(tmp_path, output_tokens=8000)
+    with pytest.raises(
+        ValueError, match="per-response output limit \\(8,000 tokens\\)"
+    ):
+        execute(directory, run, OutputLimitedModel(run.inputs), pages)
+    assert not pages.scraped
+    assert read_json(directory, "debug/call-0001.response.json")[
+        "incomplete_details"
+    ] == {"reason": "max_output_tokens"}
+    saved = read_json(directory, "run.json")
+    assert saved["status"] == "incomplete"
+    assert "tool not executed" in saved["error"]
+    assert f"{run.settings.max_model_calls - 1} calls remain" in saved["error"]
+    reopened = Run.model_validate(saved)
+    reopened.settings.output_tokens = 16000
+    from research_agent.storage import save_run
+
+    save_run(directory, reopened)
+    reopened = Run.model_validate(read_json(directory, "run.json"))
+    fresh = FakeModel(run.inputs)
+    execute(directory, reopened, fresh, FakePages())
+    assert fresh.requests[0]["max_output_tokens"] == 16000
+    budgets = [
+        item for item in fresh.requests[0]["input"] if item.get("role") == "developer"
+    ]
+    assert '"max_output_tokens_per_response": 16000' in budgets[-1]["content"]
+    assert reopened.status == "complete"

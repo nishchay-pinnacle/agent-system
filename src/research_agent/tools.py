@@ -19,6 +19,7 @@ from requests.exceptions import RequestException
 from research_agent.cleaning import clean_markdown, normalize_input, usable
 from research_agent.html_cleaning import ConversionError, clean_html
 from research_agent.storage import (
+    ContinuationArgs,
     Inputs,
     QuestionIndex,
     Run,
@@ -154,6 +155,7 @@ class FinishArgs(BaseModel):
 
 def tool_models(stage: str) -> dict[str, type[BaseModel]]:
     common: dict[str, type[BaseModel]] = {
+        "request_continuation": ContinuationArgs,
         "read_page": ReadArgs,
         "update_profile": ProfileArgs,
         "update_questions": QuestionIndex,
@@ -659,9 +661,25 @@ class OrientationTools:
 
     def validate_citations(self, content: str) -> None:
         sources = self.source_index()
-        for sid in re.findall(r"\[(S[0-9]+)\]", content):
-            if sid not in sources:
-                raise ToolInputError(f"Citation {sid} is not saved evidence")
+        # Inspect prose tokens so Markdown link labels/destinations are not
+        # mistaken for standalone short source markers.
+        for block in MarkdownIt("commonmark").parse(content):
+            in_link = False
+            for token in block.children or []:
+                if token.type == "link_open":
+                    in_link = True
+                elif token.type == "link_close":
+                    in_link = False
+                elif token.type == "text" and not in_link:
+                    for sid in re.findall(r"\[(S[0-9][^\s\[\]]*)\]", token.content):
+                        if not re.fullmatch(r"S[1-9][0-9]*", sid):
+                            raise ToolInputError(
+                                f"Invalid source marker [{sid}]; expected [S1] (S followed by a positive integer without leading zeros)"
+                            )
+                        if sid not in sources:
+                            raise ToolInputError(
+                                f"Citation {sid} is not saved evidence"
+                            )
         for link in markdown_links(content):
             parts = urlsplit(link)
             if parts.scheme or parts.netloc:
@@ -766,7 +784,7 @@ class OrientationTools:
                 }
             )
         next_offset = offset + len(results)
-        return {
+        result: dict[str, JsonValue] = {
             "matches": results,
             "total_matches": len(urls),
             "returned_matches": len(results),
@@ -776,6 +794,12 @@ class OrientationTools:
             "has_more": next_offset < len(urls),
             "evidence": "Discovery leads only; read selected HTML pages before citing",
         }
+        if urls and offset >= len(urls):
+            result["message"] = (
+                f"{len(urls)} matches exist, but offset {offset} skips them all. "
+                "Retry this search with offset 0."
+            )
+        return result
 
     def finish_research(
         self, reason: str, profile: str, question_index: QuestionIndex
@@ -857,6 +881,8 @@ class OrientationTools:
             raise ToolInputError(f"Invalid {name} arguments: {errors}") from exc
         except ValueError as exc:
             raise ToolInputError(str(exc)) from exc
+        if isinstance(args, ContinuationArgs):
+            return args.model_dump(mode="json")
         if isinstance(args, QuestionIndex):
             return self.update_questions(args)
         if isinstance(args, ReadArgs):

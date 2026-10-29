@@ -104,7 +104,7 @@ uv run python -m research_agent.main dashboard
 # Optional: --run-id orientation_YOUR_RUN_ID --port 8765 --data-dir data
 ```
 
-Open [localhost dashboard](http://127.0.0.1:8765). It is read-only and uses no API
+Open [localhost dashboard](http://127.0.0.1:8765). It displays saved artifacts and uses no API
 credentials. Start/resume remains in the CLI. The left pane follows activity only
 while you are at the bottom. The right pane shows saved metrics, per-call usage,
 questions in saved priority order, the profile, and full cleaned sources. Clicking
@@ -116,6 +116,22 @@ Markdown parser with raw HTML disabled. Images are rendered as alt text. Polling
 waits for each cycle to complete before scheduling the next; run switches invalidate
 in-flight results.
 
+The model receives remaining call/page allowances and the application byte limit
+on each turn. It can use `request_continuation` before exhaustion to explain why
+more research is worthwhile and request additional calls/pages. The dashboard
+shows this request with editable allowances and **Approve and continue** / **Keep
+paused** buttons. Only the research process applies approved allowances, once;
+all exchanges and budget messages remain in history. Existing completion checks
+still apply. Approval does not change the byte limit or provider context limits.
+
+Keep the research command running while awaiting dashboard approval. Closing the
+browser does not lose the request. If the research process exits (including after
+**Keep paused**), save approval in the dashboard and restart with the usual
+`resume --run-id ...` command. If the model exhausts its calls without requesting
+continuation, the run saves a runtime exhaustion notice and exits incomplete;
+approve that notice and resume. This fallback does not invent an AI explanation.
+No dashboard worker, background service, or automatic process launcher is added.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -125,7 +141,7 @@ in-flight results.
 | `RESEARCH_DATA_DIR` | `data` | Data root; CLI `--data-dir` overrides |
 | `RESEARCH_MAX_MODEL_CALLS` | `12` | Orientation model-call ceiling |
 | `RESEARCH_MAX_INPUT_BYTES` | `1000000` | Complete serialized-request UTF-8 byte limit |
-| `RESEARCH_OUTPUT_TOKENS` | `8000` | Maximum output tokens |
+| `RESEARCH_OUTPUT_TOKENS` | `16000` | Maximum output tokens |
 | `RESEARCH_TIMEOUT_SECONDS` | `120` | Provider attempt timeout |
 | `RESEARCH_MAP_LIMIT` | `5000` | Discovery entry limit |
 

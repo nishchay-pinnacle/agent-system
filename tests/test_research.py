@@ -219,10 +219,11 @@ def test_research_continuation_preserves_orientation_and_retains_all_exchanges(
         and "name: orientation" not in first["instructions"]
     )
     assert "build the company site index, then stop" not in str(first)
-    assert "research is now active" in first["input"][-1]["content"]
+    assert "research is now active" in first["input"][-2]["content"]
     assert "Full evidence for https://example.com/" in str(first["input"])
     assert "Target campaign product: Widget" in first["input"][0]["content"]
     assert {tool["name"] for tool in first["tools"]} == {
+        "request_continuation",
         "query_site_index",
         "read_page",
         "update_profile",
@@ -230,7 +231,7 @@ def test_research_continuation_preserves_orientation_and_retains_all_exchanges(
         "update_questions",
     }
     final_input = model.requests[-1]["input"]
-    assert len(final_input) == 22
+    assert len(final_input) == 33  # Original exchanges plus eleven budget messages.
     assert "Full evidence for https://example.com/docs" in str(final_input)
     assert "Full evidence for https://docs.vendor.test/api" in str(final_input)
     assert "Supported profile" in str(
@@ -247,7 +248,7 @@ def test_research_continuation_preserves_orientation_and_retains_all_exchanges(
         str(directory / "research/checkpoints.sqlite")
     ) as saver:
         state = saver.get({"configurable": {"thread_id": run.run_id}})["channel_values"]
-    assert "baseline" not in state and len(state["history"]) == 24
+    assert "baseline" not in state and len(state["history"]) == 35
     reopened = Run.model_validate(read_json(directory, "run.json"))
     fresh_pages, fresh_model = CompanyPages(), ResearchModel(steps)
     run_agent(
@@ -858,3 +859,206 @@ def test_explicit_merge_preserves_question_and_requires_target_resolution(
     fresh.finish_research("All questions accounted for", "Final [S1]", saved)
     assert fresh.complete()
     assert read_json(directory, "questions.json")["questions"][0]["merged_into"] == "Q2"
+
+
+@pytest.mark.parametrize("offset", [3, 50])
+def test_index_out_of_range_reports_matches_without_reset(
+    tmp_path: Path, offset: int
+) -> None:
+    directory, run, pages = oriented(tmp_path)
+    tools = enter(directory, run, pages)
+    before = list(pages.scraped)
+    result = tools.query_site_index("product api", offset=offset, limit=2)
+    assert result == {
+        "matches": [],
+        "total_matches": 3,
+        "returned_matches": 0,
+        "offset": offset,
+        "limit": 2,
+        "next_offset": None,
+        "has_more": False,
+        "evidence": "Discovery leads only; read selected HTML pages before citing",
+        "message": f"3 matches exist, but offset {offset} skips them all. Retry this search with offset 0.",
+    }
+    empty = tools.query_site_index("absent", offset=offset, limit=2)
+    assert "message" not in empty
+    assert empty["total_matches"] == empty["returned_matches"] == 0
+    assert empty["matches"] == [] and empty["offset"] == offset
+    assert empty["next_offset"] is None and empty["has_more"] is False
+    assert pages.scraped == before
+
+
+def test_short_citation_markers_and_ordinary_brackets(tmp_path: Path) -> None:
+    directory, run, pages = oriented(tmp_path)
+    tools = enter(directory, run, pages)
+    tools.validate_citations("Supported [S1] and [S2].")
+    with pytest.raises(ToolInputError, match="Citation S999 is not saved evidence"):
+        tools.validate_citations("Unknown [S999].")
+    for marker in ("[S999x]", "[S0]", "[S01]"):
+        with pytest.raises(ToolInputError) as error:
+            tools.validate_citations(f"Claim {marker}.")
+        assert f"Invalid source marker {marker}" in str(error.value)
+        assert "expected [S1]" in str(error.value)
+    tools.validate_citations(
+        "[Note] [Supported platforms] [S3 storage] [2026] "
+        "[Docs](https://example.com/docs) [S999x](https://example.com/) "
+        "[S0][reference]\n\n[reference]: https://example.com/"
+    )
+
+
+def test_dashboard_continuation_reopens_checkpoint_and_retains_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from research_agent.storage import save_json
+
+    directory, run, pages = oriented(tmp_path)
+    tools = enter(directory, run, pages, calls=1)
+    steps = [
+        (
+            "request_continuation",
+            {
+                "reason": "Resolve Q1",
+                "unresolved_questions": ["Q1"],
+                "next_steps": "Review saved evidence",
+                "additional_calls": 2,
+                "additional_pages": 0,
+            },
+        ),
+        ("finish_research", {"reason": "Public evidence exhausted"}),
+    ]
+    model = ResearchModel(steps)
+
+    def interrupt(seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("research_agent.agent.time.sleep", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        run_agent(directory, run, model, tools)
+    saved = Run.model_validate(read_json(directory, "run.json"))
+    assert saved.status == "awaiting_continuation"
+    assert saved.model_calls == 6
+    assert saved.continuation is not None
+    save_json(
+        directory,
+        "continuation-decision.json",
+        {
+            "request_id": saved.continuation.request_id,
+            "approve": True,
+            "additional_calls": 2,
+            "additional_pages": 0,
+        },
+    )
+    fresh = ResearchModel(steps)
+    run_agent(
+        directory,
+        saved,
+        fresh,
+        OrientationTools(directory, saved.inputs, saved.settings, pages, saved),
+    )
+    assert saved.status == "complete"
+    assert saved.settings.max_model_calls == 8
+    assert saved.model_calls == 7
+    assert len(fresh.requests) == 1
+    history = str(fresh.requests[0]["input"])
+    assert "Resolve Q1" in history and "Provisional product profile" in history
+    assert "calls_remaining_including_this_response" in history
+    assert "approved" in history
+    # Reopening a completed checkpoint cannot consume the same approval twice.
+    reopened = Run.model_validate(read_json(directory, "run.json"))
+    run_agent(
+        directory,
+        reopened,
+        ResearchModel(steps),
+        OrientationTools(
+            directory, reopened.inputs, reopened.settings, pages, reopened
+        ),
+    )
+    assert reopened.settings.max_model_calls == 8
+
+
+def test_continuation_decline_preserves_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from research_agent.storage import save_json
+
+    directory, run, pages = oriented(tmp_path)
+    tools = enter(directory, run, pages, calls=1)
+    model = ResearchModel(
+        [
+            (
+                "request_continuation",
+                {
+                    "reason": "More evidence needed",
+                    "unresolved_questions": ["Q1"],
+                    "next_steps": "Read documentation",
+                    "additional_calls": 2,
+                    "additional_pages": 1,
+                },
+            )
+        ]
+    )
+
+    def decline(seconds: float) -> None:
+        assert run.continuation is not None
+        save_json(
+            directory,
+            "continuation-decision.json",
+            {
+                "request_id": run.continuation.request_id,
+                "approve": False,
+                "additional_calls": 2,
+                "additional_pages": 1,
+            },
+        )
+
+    monkeypatch.setattr("research_agent.agent.time.sleep", decline)
+    with pytest.raises(ValueError, match="declined"):
+        run_agent(directory, run, model, tools)
+    assert run.status == "awaiting_continuation"
+    assert run.settings.max_model_calls == 6
+    assert (directory / "profile.md").exists()
+    assert not (directory / "research/completion.json").exists()
+
+
+def test_continuation_approval_wakes_running_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from research_agent.storage import save_json
+
+    directory, run, pages = oriented(tmp_path)
+    tools = enter(directory, run, pages, calls=1, budget=1)
+    model = ResearchModel(
+        [
+            (
+                "request_continuation",
+                {
+                    "reason": "Resolve remaining questions",
+                    "unresolved_questions": ["Q1"],
+                    "next_steps": "Review sources",
+                    "additional_calls": 2,
+                    "additional_pages": 1,
+                },
+            ),
+            ("finish_research", {"reason": "Public evidence exhausted"}),
+        ]
+    )
+
+    def approve(seconds: float) -> None:
+        assert len(model.requests) == 1  # Waiting makes no further provider calls.
+        assert run.continuation is not None
+        save_json(
+            directory,
+            "continuation-decision.json",
+            {
+                "request_id": run.continuation.request_id,
+                "approve": True,
+                "additional_calls": 3,
+                "additional_pages": 2,  # User edits the proposal.
+            },
+        )
+
+    monkeypatch.setattr("research_agent.agent.time.sleep", approve)
+    run_agent(directory, run, model, tools)
+    assert run.status == "complete" and len(model.requests) == 2
+    assert run.settings.max_model_calls == 9 and run.research_page_budget == 3
+    assert run.settings.max_input_bytes == 96000

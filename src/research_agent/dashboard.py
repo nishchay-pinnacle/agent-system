@@ -1,4 +1,4 @@
-"""Read-only localhost dashboard over allowlisted run artifacts, with no provider calls."""
+"""Localhost dashboard with saved continuation decisions; no provider calls."""
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,7 +10,14 @@ from bs4 import BeautifulSoup
 from markdown_it import MarkdownIt
 from pydantic import JsonValue
 
-from research_agent.storage import local_path, read_json, run_directory
+from research_agent.storage import (
+    ContinuationDecision,
+    Run,
+    local_path,
+    read_json,
+    run_directory,
+    save_json,
+)
 
 
 def render_profile(content: str) -> str:
@@ -95,6 +102,56 @@ def handler(root: Path, selected: str | None) -> type[BaseHTTPRequestHandler]:
         def log_message(self, format: str, *args: object) -> None:
             pass
 
+        def do_POST(self) -> None:
+            if urlsplit(self.path).path != "/api/continuation":
+                self.send_error(501)
+                return
+            assert isinstance(self.server, ThreadingHTTPServer)
+            host = self.headers.get("Host", "")
+            if (
+                host
+                not in {
+                    f"127.0.0.1:{self.server.server_port}",
+                    f"localhost:{self.server.server_port}",
+                }
+                or self.headers.get("Origin") != f"http://{host}"
+            ):
+                self.send_error(403)
+                return
+            try:
+                if self.headers.get("Content-Type") != "application/json":
+                    raise ValueError("Expected JSON")
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 4096:
+                    raise ValueError("Invalid body size")
+                query = parse_qs(urlsplit(self.path).query)
+                directory = run_directory(root, query.get("run", [selected or ""])[0])
+                decision = ContinuationDecision.model_validate_json(
+                    self.rfile.read(length)
+                )
+                run = Run.model_validate(read_json(directory, "run.json"))
+                pending = run.continuation
+                if (
+                    pending is None
+                    or pending.status != "pending"
+                    or pending.request_id != decision.request_id
+                ):
+                    raise ValueError("No matching pending request")
+                if decision.approve and (
+                    run.settings.max_model_calls + decision.additional_calls > 1000
+                    or run.research_page_budget + decision.additional_pages > 10000
+                    or (run.stage != "research" and decision.additional_pages)
+                ):
+                    raise ValueError("Allowance exceeds supported limits")
+                save_json(
+                    directory, "continuation-decision.json", decision.model_dump()
+                )
+            except (ValueError, OSError):
+                self.send_error(400, "Invalid continuation decision")
+                return
+            self.send_response(204)
+            self.end_headers()
+
         def do_GET(self) -> None:
             # Reject DNS rebinding and cross-origin reads; bind only IPv4 localhost.
             assert isinstance(self.server, ThreadingHTTPServer)
@@ -165,7 +222,7 @@ def serve(root: Path, run_id: str | None = None, port: int = 8765) -> None:
     if run_id:
         run_directory(root, run_id)
     with ThreadingHTTPServer(("127.0.0.1", port), handler(root, run_id)) as server:
-        print(f"Read-only dashboard: http://127.0.0.1:{server.server_port}", flush=True)
+        print(f"Dashboard: http://127.0.0.1:{server.server_port}", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:

@@ -61,12 +61,13 @@ def test_openai_sdk_sends_exact_model_and_tools(
             "store": False,
             "include": ["reasoning.encrypted_content"],
             "truncation": "disabled",
-            "max_output_tokens": 8000,
+            "max_output_tokens": 16000,
         }
     )
     assert result["status"] == "completed"
     assert sent[0]["model"] == "explicit-test-model"
     assert {tool["name"] for tool in sent[0]["tools"]} == {
+        "request_continuation",
         "read_page",
         "update_profile",
         "build_site_index",

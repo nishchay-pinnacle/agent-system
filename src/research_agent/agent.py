@@ -1,6 +1,7 @@
 """One tool-calling agent; LangGraph checkpoints contain only transcript references."""
 
 import json
+import time
 from importlib.resources import files
 from pathlib import Path
 from typing import Protocol, TypedDict
@@ -18,6 +19,9 @@ from research_agent.cli import CLI
 from research_agent.storage import (
     JSON_OBJECT,
     RESEARCH_START,
+    ContinuationArgs,
+    ContinuationDecision,
+    ContinuationRequest,
     FirecrawlCounts,
     ResearchStart,
     Run,
@@ -176,6 +180,7 @@ def definitions(stage: str = "orientation") -> list[dict[str, JsonValue]]:
             "type": "function",
             "name": name,
             "description": {
+                "request_continuation": "Pause for dashboard approval of additional calls/pages. Explain why more research is worthwhile, unresolved questions, and next steps. Use before exhausting the allowance if completion is not justified.",
                 "read_page": "Read a permitted HTML page; returns full cleaned evidence and its saved source reference.",
                 "update_profile": "Replace the full Markdown profile with saved-source citations and remaining uncertainties.",
                 "update_questions": "Save the full ordered question index and active question. Assess relevant successfully read sources for every affected question; useful evidence resets that question’s streak. Preserve every existing question ID and prior assessments. Explicit merges retain the original question with status merged, merged_into naming a non-merged target, and closure_reason.",
@@ -211,13 +216,100 @@ def run_agent(
     tools.run, tools.settings = run, run.settings
     prefix = "research-" if run.stage == "research" else ""
 
+    def await_continuation(request_id: str, args: ContinuationArgs) -> None:
+        pending = run.continuation
+        if pending is None or pending.request_id != request_id:
+            pending = ContinuationRequest(request_id=request_id, **args.model_dump())
+            run.continuation = pending
+        if pending.status == "applied":
+            return
+        run.status = "awaiting_continuation"
+        save_run(directory, run)
+        display.event("Paused", "Awaiting dashboard continuation approval")
+        while True:
+            path = local_path(directory, "continuation-decision.json")
+            if path.exists():
+                decision = ContinuationDecision.model_validate(
+                    read_json(directory, "continuation-decision.json")
+                )
+                if decision.request_id == request_id:
+                    if not decision.approve:
+                        raise ValueError(
+                            "Continuation declined; progress saved. Resume to reconsider."
+                        )
+                    settings = run.settings.model_copy(
+                        update={
+                            "max_model_calls": run.settings.max_model_calls
+                            + decision.additional_calls
+                        }
+                    )
+                    settings = type(settings).model_validate(settings.model_dump())
+                    pages = run.research_page_budget + decision.additional_pages
+                    if pages > 10000 or (
+                        run.stage != "research" and decision.additional_pages
+                    ):
+                        raise ValueError("Invalid additional page allowance")
+                    run.settings = settings
+                    run.research_page_budget = pages
+                    tools.settings = run.settings
+                    pending.status = "applied"
+                    run.status, run.error = "incomplete", None
+                    # Allowances and consumption marker are committed together.
+                    save_run(directory, run)
+                    return
+            time.sleep(1)
+
     def model_node(state: State) -> State:
         turn = state["turn"]
+        history = list(state["history"])
         response_name = f"debug/{prefix}turn-{turn:04d}.response.json"
         request_name = f"debug/{prefix}turn-{turn:04d}.request.json"
         if not local_path(directory, response_name).exists():
+            if run.continuation is not None and run.continuation.status == "pending":
+                if (
+                    run.continuation.origin == "runtime"
+                    and run.model_calls < run.settings.max_model_calls
+                ):
+                    # Existing CLI resume overrides remain an explicit approval path.
+                    run.continuation.status = "applied"
+                    save_run(directory, run)
+                elif (
+                    run.continuation.origin == "model"
+                    or local_path(directory, "continuation-decision.json").exists()
+                ):
+                    await_continuation(run.continuation.request_id, run.continuation)
+            budget_name = f"debug/{prefix}turn-{turn:04d}.budget.json"
+            budget = {
+                "stage": run.stage,
+                "model_calls_used": run.model_calls,
+                "max_model_calls": run.settings.max_model_calls,
+                "calls_remaining_including_this_response": max(
+                    0, run.settings.max_model_calls - run.model_calls
+                ),
+                "research_pages_used": run.research_page_attempts,
+                "research_page_budget": run.research_page_budget,
+                "max_input_bytes": run.settings.max_input_bytes,
+                "max_output_tokens_per_response": run.settings.output_tokens,
+            }
+            save_json(
+                directory,
+                budget_name,
+                {
+                    "items": [
+                        {
+                            "role": "developer",
+                            "content": "Current application allowances: "
+                            + json.dumps(budget)
+                            + ". These are soft planning limits but enforced until the user approves more. "
+                            "Use the last available call to finish if justified, or request_continuation with a reason and next steps. "
+                            "You may request earlier. Exhaustion does not mean completion. The byte limit is not a model context guarantee.",
+                        }
+                    ]
+                },
+            )
+            history.append(budget_name)
             items: list[dict[str, JsonValue]] = []
-            for reference in state["history"]:
+            for reference in history:
                 saved_items = JSON_ITEMS.validate_python(
                     read_json(directory, reference)["items"]
                 )
@@ -259,6 +351,17 @@ def run_agent(
                     f"Complete model input is {request_bytes} UTF-8 bytes; max_input_bytes is {run.settings.max_input_bytes}. Nothing truncated. Run incomplete; resume with --max-input-bytes to raise the application size limit. This does not guarantee the request fits the model context."
                 )
             if run.model_calls >= run.settings.max_model_calls:
+                if run.continuation is None or run.continuation.status == "applied":
+                    run.continuation = ContinuationRequest(
+                        request_id=f"{prefix}exhausted-{run.model_calls}",
+                        origin="runtime",
+                        reason="Model-call allowance exhausted before completion.",
+                        unresolved_questions=[],
+                        next_steps="Resume saved research after approval.",
+                        additional_calls=10,
+                        additional_pages=0,
+                    )
+                save_run(directory, run)
                 raise ValueError(
                     f"Model-call limit exhausted; {run.stage} incomplete. Resume with a higher --max-model-calls to continue explicitly."
                 )
@@ -275,6 +378,17 @@ def run_agent(
             )
             display.model_result(response.get("usage"))
             if response.get("status") != "completed":
+                details = response.get("incomplete_details")
+                if (
+                    isinstance(details, dict)
+                    and details.get("reason") == "max_output_tokens"
+                ):
+                    raise ValueError(
+                        f"Model response exceeded the per-response output limit ({run.settings.output_tokens:,} tokens); "
+                        "partial response saved, tool not executed. Increase this run's saved output_tokens "
+                        "setting before resuming. This is not the model-call limit; "
+                        f"{max(0, run.settings.max_model_calls - run.model_calls)} calls remain."
+                    )
                 raise ValueError(
                     "Model response incomplete; response retained, resume retries within the call limit"
                 )
@@ -287,7 +401,10 @@ def run_agent(
             save_json(directory, response_name, {"items": output})
         else:
             display.event("Model", "Reusing saved response")
-        return {"history": state["history"] + [response_name], "turn": turn}
+            budget_name = f"debug/{prefix}turn-{turn:04d}.budget.json"
+            if local_path(directory, budget_name).exists():
+                history.append(budget_name)
+        return {"history": history + [response_name], "turn": turn}
 
     def tool_node(state: State) -> State:
         output = JSON_ITEMS.validate_python(
@@ -306,6 +423,15 @@ def run_agent(
             display.tool_call(str(name), str(arguments))
             try:
                 result = tools.execute(str(name), str(arguments))
+                if name == "request_continuation":
+                    await_continuation(
+                        str(call_id), ContinuationArgs.model_validate(result)
+                    )
+                    result = {
+                        "approved": True,
+                        "max_model_calls": run.settings.max_model_calls,
+                        "research_page_budget": run.research_page_budget,
+                    }
             except ToolInputError as exc:
                 result = {
                     "error": str(exc),
@@ -344,7 +470,7 @@ def run_agent(
     graph.add_conditional_edges("tool", route, {END: END, "model": "model"})
     config: RunnableConfig = {
         "configurable": {"thread_id": run.run_id},
-        "recursion_limit": run.settings.max_model_calls * 2 + 10,
+        "recursion_limit": 2010,  # Settings caps total model calls at 1000.,
     }
     run.status, run.error = "incomplete", None
     save_run(directory, run)
